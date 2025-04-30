@@ -1,0 +1,17 @@
+{
+  "name": "mock-data-factory",
+  "version": "1.0.0",
+  "description": "A web application that allows users to define data schemas and generate realistic test data",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo 'No build step required'"
+  },
+  "keywords": [
+    "mock-data",
+    "data-generator",
+    "flask",
+    "python"
+  ],
+  "author": "",
+  "license": "MIT"
+}

@@ -1,0 +1,15 @@
+[build]
+  command = "pip install -r requirements.txt"
+  publish = "static"
+
+[build.environment]
+  PYTHON_VERSION = "3.9"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/app"
+  status = 200
