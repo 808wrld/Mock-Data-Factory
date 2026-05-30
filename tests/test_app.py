@@ -10,9 +10,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import (  # noqa: E402
+    MAX_CONTENT_LENGTH,
+    MAX_FIELDS,
     MAX_ROWS,
     SchemaError,
     _infer_sql_type,
+    _sanitize_xml_name,
     _validate_schema,
     app,
     format_csv,
@@ -507,3 +510,93 @@ def test_infer_endpoint_rejects_oversize_source(client):
         "source": "x" * 40000,
     })
     assert response.status_code == 400
+
+
+# ---- Hardening: XML name sanitizer + field-level validation ---------------
+
+def test_sanitize_xml_name_replaces_invalid_chars():
+    assert _sanitize_xml_name("user name") == "user_name"
+    assert _sanitize_xml_name("col<>&") == "col___"
+    assert _sanitize_xml_name("") == "_field"
+
+
+def test_sanitize_xml_name_prepends_underscore_for_digit_start():
+    assert _sanitize_xml_name("1col") == "_1col"
+
+
+def test_format_xml_accepts_field_names_starting_with_digit():
+    # Regression: this used to raise ValueError → 500.
+    data = [{"1col": "value"}]
+    out = format_xml(data)
+    assert "<_1col>value</_1col>" in out
+
+
+def test_format_xml_accepts_field_names_with_spaces():
+    data = [{"col with space": "v"}]
+    out = format_xml(data)
+    assert "<col_with_space>v</col_with_space>" in out
+
+
+def test_validate_schema_rejects_field_without_name():
+    with pytest.raises(SchemaError):
+        _validate_schema({"fields": [{"type": "First Name"}], "num_rows": 1, "format": "CSV"})
+
+
+def test_validate_schema_rejects_field_without_type():
+    with pytest.raises(SchemaError):
+        _validate_schema({"fields": [{"name": "x"}], "num_rows": 1, "format": "CSV"})
+
+
+def test_validate_schema_rejects_non_dict_field():
+    with pytest.raises(SchemaError):
+        _validate_schema({"fields": ["not a dict"], "num_rows": 1, "format": "CSV"})
+
+
+def test_validate_schema_rejects_custom_list_without_values():
+    with pytest.raises(SchemaError):
+        _validate_schema({
+            "fields": [{"name": "x", "type": "Custom List"}],
+            "num_rows": 1, "format": "CSV",
+        })
+
+
+def test_validate_schema_rejects_template_without_template():
+    with pytest.raises(SchemaError):
+        _validate_schema({
+            "fields": [{"name": "x", "type": "Template"}],
+            "num_rows": 1, "format": "CSV",
+        })
+
+
+def test_validate_schema_rejects_too_many_fields():
+    fields = [{"name": f"c{i}", "type": "First Name"} for i in range(MAX_FIELDS + 1)]
+    with pytest.raises(SchemaError):
+        _validate_schema({"fields": fields, "num_rows": 1, "format": "CSV"})
+
+
+def test_validate_schema_rejects_bad_blank_percentage():
+    with pytest.raises(SchemaError):
+        _validate_schema({
+            "fields": [{"name": "x", "type": "First Name", "blank_percentage": 150}],
+            "num_rows": 1, "format": "CSV",
+        })
+
+
+def test_endpoint_rejects_malformed_field(client):
+    response = client.post("/preview", json={
+        "fields": [{"type": "First Name"}],  # no name
+        "num_rows": 1, "format": "CSV",
+    })
+    assert response.status_code == 400
+    assert "name" in response.get_json()["error"]
+
+
+def test_endpoint_returns_413_for_oversize_request(client):
+    # Build a payload larger than MAX_CONTENT_LENGTH.
+    huge_source = "x" * (MAX_CONTENT_LENGTH + 100)
+    response = client.post(
+        "/infer-schema",
+        data=f'{{"kind":"json","source":"{huge_source}"}}',
+        content_type="application/json",
+    )
+    assert response.status_code == 413
