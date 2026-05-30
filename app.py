@@ -1,340 +1,345 @@
-from flask import Flask, request, jsonify, send_file, render_template
-from faker import Faker
+"""Mock Data Factory — Flask application.
+
+Generates realistic mock data based on a user-supplied schema and exports it
+as CSV, JSON, XML, SQL, or Excel.
+"""
+from __future__ import annotations
+
 import csv
-import json
 import io
+import json
+import logging
+import os
 import random
-from datetime import datetime, timedelta
-import xml.etree.ElementTree as ET
 import xml.dom.minidom
-try:
-    import openpyxl
-    from openpyxl.utils import get_column_letter
-    EXCEL_AVAILABLE = True
-except ImportError:
-    EXCEL_AVAILABLE = False
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from typing import Any, Callable
+
+import openpyxl
+from faker import Faker
+from flask import Flask, jsonify, render_template, request, send_file
+from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
 fake = Faker()
+logger = logging.getLogger(__name__)
 
-def generate_value(field_type, field_config=None):
-    """Generate a single value based on the field type and configuration."""
-    if field_type == "Row Number":
-        return None  # Will be filled in later
-    elif field_type == "First Name":
-        return fake.first_name()
-    elif field_type == "Last Name":
-        return fake.last_name()
-    elif field_type == "Full Name":
-        return fake.name()
-    elif field_type == "Email Address":
-        return fake.email()
-    elif field_type == "Gender":
-        return random.choice(["Male", "Female", "Other"])
-    elif field_type == "IP Address v4":
-        return fake.ipv4()
-    elif field_type == "Phone Number":
-        return fake.phone_number()
-    elif field_type == "City":
-        return fake.city()
-    elif field_type == "Country":
-        return fake.country()
-    elif field_type == "Date":
-        start_date = datetime.now() - timedelta(days=365*5)  # 5 years ago
-        end_date = datetime.now()
-        return fake.date_between(start_date=start_date, end_date=end_date).strftime('%Y-%m-%d')
-    elif field_type == "Number":
-        return random.randint(1, 1000)
-    elif field_type == "Decimal":
-        return round(random.uniform(0, 1000), 2)
-    elif field_type == "Custom List":
-        if field_config and "values" in field_config:
-            return random.choice(field_config["values"])
-        return ""
-    elif field_type == "Blank/Null":
-        blank_percentage = field_config.get("blank_percentage", 0) if field_config else 0
-        return None if random.random() < (blank_percentage / 100) else fake.word()
+# Hard cap to protect against memory exhaustion / DoS.
+MAX_ROWS = int(os.getenv("MOCK_DATA_MAX_ROWS", "100000"))
+MAX_PREVIEW_ROWS = 100
+
+DEFAULT_SCHEMA = [
+    {"name": "id", "type": "Row Number"},
+    {"name": "first_name", "type": "First Name"},
+    {"name": "last_name", "type": "Last Name"},
+    {"name": "email", "type": "Email Address"},
+    {"name": "gender", "type": "Gender"},
+    {"name": "ip_address", "type": "IP Address v4"},
+]
+
+SUPPORTED_FORMATS = {"CSV", "JSON", "XML", "SQL", "EXCEL"}
+
+
+class SchemaError(ValueError):
+    """Raised for any user-facing schema validation failure."""
+
+
+def _date_within_last_five_years(_config: dict | None = None) -> str:
+    start = datetime.now() - timedelta(days=365 * 5)
+    end = datetime.now()
+    return fake.date_between(start_date=start, end_date=end).strftime("%Y-%m-%d")
+
+
+def _custom_list(config: dict | None) -> str:
+    if config and config.get("values"):
+        return random.choice(config["values"])
     return ""
 
-def generate_data(schema, max_rows=None):
-    """Generate data based on the schema, with an optional limit on rows."""
-    num_rows = min(schema["num_rows"], max_rows) if max_rows else schema["num_rows"]
-    data = []
-    
-    # Extract field names in the exact order they appear in the schema
-    field_names = [field["name"] for field in schema["fields"]]
-    
+
+# Dispatch table — extending the generator is just one new entry.
+GENERATORS: dict[str, Callable[[dict | None], Any]] = {
+    "Row Number": lambda _c: None,  # Filled by index in generate_data.
+    "First Name": lambda _c: fake.first_name(),
+    "Last Name": lambda _c: fake.last_name(),
+    "Full Name": lambda _c: fake.name(),
+    "Email Address": lambda _c: fake.email(),
+    "Gender": lambda _c: random.choice(("Male", "Female", "Other")),
+    "IP Address v4": lambda _c: fake.ipv4(),
+    "Phone Number": lambda _c: fake.phone_number(),
+    "City": lambda _c: fake.city(),
+    "Country": lambda _c: fake.country(),
+    "Date": _date_within_last_five_years,
+    "Number": lambda _c: random.randint(1, 1000),
+    "Decimal": lambda _c: round(random.uniform(0, 1000), 2),
+    "Custom List": _custom_list,
+    # Legacy "Blank/Null" type — kept for backward compatibility with old
+    # client schemas. Prefer the per-field "blank_percentage" modifier now.
+    "Blank/Null": lambda c: None if random.random() < ((c or {}).get("blank_percentage", 0) / 100) else fake.word(),
+}
+
+
+def generate_value(field_type: str, field_config: dict | None = None) -> Any:
+    """Generate a single value for a field type."""
+    gen = GENERATORS.get(field_type)
+    return gen(field_config) if gen else ""
+
+
+def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
+    """Generate rows for the schema. `max_rows` (if provided) caps row count."""
+    requested = int(schema["num_rows"])
+    if requested < 1:
+        raise SchemaError("num_rows must be at least 1")
+
+    num_rows = min(requested, max_rows) if max_rows else requested
+    num_rows = min(num_rows, MAX_ROWS)
+
+    fields = schema["fields"]
+    data: list[dict] = []
+    # Python 3.7+ dicts preserve insertion order, so iterating `fields`
+    # already produces a deterministic column order.
     for i in range(num_rows):
-        row = {}
-        for field in schema["fields"]:
+        row: dict[str, Any] = {}
+        for field in fields:
             value = generate_value(field["type"], field)
             if field["type"] == "Row Number":
                 value = i + 1
+            # Per-field blank modifier (works for any type, not just Blank/Null).
+            blank_pct = field.get("blank_percentage")
+            if blank_pct and random.random() < (blank_pct / 100):
+                value = None
             row[field["name"]] = value
-        
-        # Create an ordered dictionary to ensure field order matches schema order
-        ordered_row = {name: row.get(name) for name in field_names}
-        data.append(ordered_row)
+        data.append(row)
     return data
 
-def format_csv(data):
-    """Format data as CSV string."""
+
+def format_csv(data: list[dict]) -> str:
+    """Render data as a CSV string."""
     output = io.StringIO()
     if data:
-        writer = csv.DictWriter(output, fieldnames=data[0].keys())
+        writer = csv.DictWriter(output, fieldnames=list(data[0].keys()))
         writer.writeheader()
         writer.writerows(data)
     return output.getvalue()
 
-def format_json(data):
-    """Format data as JSON string."""
+
+def format_json(data: list[dict]) -> str:
+    """Render data as a JSON string."""
     return json.dumps(data, indent=2)
 
-def format_xml(data):
-    """Format data as XML string."""
+
+def format_xml(data: list[dict]) -> str:
+    """Render data as a pretty-printed XML string."""
     root = ET.Element("records")
-    
     for item in data:
         record = ET.SubElement(root, "record")
         for key, value in item.items():
             field = ET.SubElement(record, key)
-            # Handle None values
-            if value is not None:
-                field.text = str(value)
-            else:
-                field.text = ""
-    
-    # Pretty print XML
-    xml_string = ET.tostring(root, encoding='utf-8')
-    dom = xml.dom.minidom.parseString(xml_string)
-    pretty_xml = dom.toprettyxml(indent="  ")
-    
-    # Remove the XML declaration line
-    if pretty_xml.startswith('<?xml'):
-        pretty_xml = '\n'.join(pretty_xml.split('\n')[1:])
-        
-    return pretty_xml
+            field.text = "" if value is None else str(value)
 
-def format_sql(data, table_name='mock_data'):
-    """Format data as SQL INSERT statements."""
+    xml_bytes = ET.tostring(root, encoding="utf-8")
+    pretty = xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent="  ")
+    # Strip the <?xml ... ?> declaration line.
+    if pretty.startswith("<?xml"):
+        pretty = "\n".join(pretty.splitlines()[1:])
+    return pretty
+
+
+def _infer_sql_type(column: str, data: list[dict]) -> str:
+    """Detect the SQL column type from the first non-null value in the column."""
+    for row in data:
+        value = row.get(column)
+        if value is None:
+            continue
+        # bool is a subclass of int — exclude it to avoid surprising INTEGER columns.
+        if isinstance(value, bool):
+            return "INTEGER"
+        if isinstance(value, int):
+            return "INTEGER"
+        if isinstance(value, float):
+            return "REAL"
+        if isinstance(value, str) and value.strip():
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+                return "DATE"
+            except ValueError:
+                return "TEXT"
+        return "TEXT"
+    return "TEXT"
+
+
+def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
+    """Render data as a CREATE TABLE + INSERT script."""
     if not data:
         return ""
-    
-    sql_output = [f"-- SQL Data Export\n-- Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"]
-    
-    # Create table statement
+
     columns = list(data[0].keys())
-    sql_output.append(f"CREATE TABLE IF NOT EXISTS {table_name} (")
-    column_defs = []
-    
-    for col in columns:
-        # Determine column type based on the first non-null value
-        col_type = "TEXT"  # Default type
-        for row in data:
-            value = row[col]
-            if value is not None:
-                if isinstance(value, int):
-                    col_type = "INTEGER"
-                elif isinstance(value, float):
-                    col_type = "REAL"
-                elif isinstance(value, str) and value.strip() != "":
-                    try:
-                        datetime.strptime(value, '%Y-%m-%d')
-                        col_type = "DATE"
-                    except ValueError:
-                        col_type = "TEXT"
-                break
-        
-        column_defs.append(f"    {col} {col_type}")
-    
-    sql_output.append(",\n".join(column_defs))
-    sql_output.append(");\n")
-    
-    # Insert statements
+    lines = [
+        "-- SQL Data Export",
+        f"-- Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"CREATE TABLE IF NOT EXISTS {table_name} (",
+    ]
+    column_defs = [f"    {col} {_infer_sql_type(col, data)}" for col in columns]
+    lines.append(",\n".join(column_defs))
+    lines.append(");")
+    lines.append("")
+
+    column_list = ", ".join(columns)
     for row in data:
         values = []
         for col in columns:
             value = row[col]
             if value is None:
                 values.append("NULL")
+            elif isinstance(value, bool):
+                values.append("1" if value else "0")
             elif isinstance(value, (int, float)):
                 values.append(str(value))
             else:
-                # Escape single quotes in string values
-                values.append(f"'{str(value).replace('\'', '\'\'')}'" if value is not None else "NULL")
-        
-        sql_output.append(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(values)});")
-    
-    return "\n".join(sql_output)
+                escaped = str(value).replace("'", "''")
+                values.append(f"'{escaped}'")
+        lines.append(f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(values)});")
 
-def format_excel(data):
-    """Format data as Excel file (bytes)."""
-    if not EXCEL_AVAILABLE:
-        raise Exception("Excel generation requires openpyxl. Please install it with 'pip install openpyxl'")
-    
+    return "\n".join(lines)
+
+
+def format_excel(data: list[dict]) -> bytes | None:
+    """Render data as an .xlsx byte string."""
     if not data:
         return None
-    
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Mock Data"
-    
-    # Write headers
+
     headers = list(data[0].keys())
+    bold = openpyxl.styles.Font(bold=True)
+    max_widths = [len(str(h)) for h in headers]
+
     for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.value = header
-        cell.font = openpyxl.styles.Font(bold=True)
-    
-    # Write data
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = bold
+
+    # Single pass: write data and track max width simultaneously.
     for row_idx, row_data in enumerate(data, 2):
         for col_idx, header in enumerate(headers, 1):
-            ws.cell(row=row_idx, column=col_idx).value = row_data[header]
-    
-    # Auto-adjust column widths
-    for col_idx, header in enumerate(headers, 1):
-        column_letter = get_column_letter(col_idx)
-        max_length = len(str(header))
-        
-        for row_idx, row_data in enumerate(data, 2):
-            cell_value = row_data[header]
-            if cell_value is not None:
-                max_length = max(max_length, len(str(cell_value)))
-        
-        adjusted_width = max_length + 2  # Add some padding
-        ws.column_dimensions[column_letter].width = adjusted_width
-    
-    # Save to bytes
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    
-    return output.getvalue()
+            value = row_data[header]
+            ws.cell(row=row_idx, column=col_idx, value=value)
+            if value is not None:
+                width = len(str(value))
+                if width > max_widths[col_idx - 1]:
+                    max_widths[col_idx - 1] = width
 
-@app.route('/')
-def index():
-    # Define default schema with 6 predefined fields
-    default_schema = [
-        {"name": "id", "type": "Row Number"},
-        {"name": "first_name", "type": "First Name"},
-        {"name": "last_name", "type": "Last Name"},
-        {"name": "email", "type": "Email Address"},
-        {"name": "gender", "type": "Gender"},
-        {"name": "ip_address", "type": "IP Address v4"}
-    ]
-    return render_template('index.html', default_schema=default_schema)
+    for col_idx, width in enumerate(max_widths, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width + 2
 
-@app.route('/preview', methods=['POST'])
-def preview():
-    """Generate a preview of the data in the requested format.
-    
-    Handles CSV, JSON, XML, SQL formats with a limited number of rows.
-    For Excel, returns a message indicating preview is not available.
-    """
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+FORMATTERS: dict[str, dict] = {
+    "CSV": {"format": format_csv, "mime": "text/csv", "ext": "csv"},
+    "JSON": {"format": format_json, "mime": "application/json", "ext": "json"},
+    "XML": {"format": format_xml, "mime": "application/xml", "ext": "xml"},
+    "SQL": {"format": format_sql, "mime": "text/plain", "ext": "sql"},
+    "EXCEL": {
+        "format": format_excel,
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ext": "xlsx",
+    },
+}
+
+
+def _validate_schema(schema: Any) -> dict:
+    """Validate the incoming schema, raising SchemaError on any issue."""
+    if not isinstance(schema, dict):
+        raise SchemaError("Schema must be a JSON object")
+    for key in ("fields", "num_rows", "format"):
+        if key not in schema:
+            raise SchemaError(f"Schema missing required key: {key}")
+    if not isinstance(schema["fields"], list) or not schema["fields"]:
+        raise SchemaError("Schema must contain at least one field")
+    fmt = str(schema["format"]).upper()
+    if fmt not in SUPPORTED_FORMATS:
+        raise SchemaError(f"Unsupported format: {schema['format']}")
     try:
-        schema = request.json
-        if not schema or "fields" not in schema or "num_rows" not in schema or "format" not in schema:
-            return jsonify({"error": "Invalid schema format"}), 400
-        
-        # Limit preview to 20 rows maximum
-        max_preview_rows = 20
-        format_type = schema["format"].upper()
-        
-        # Generate limited data
-        data = generate_data(schema, max_preview_rows)
-        
-        # For CSV and Excel, return the raw data as JSON for table rendering
-        if format_type in ["CSV", "EXCEL"]:
-            # Preserve field order from schema by including it in the response
+        rows = int(schema["num_rows"])
+    except (TypeError, ValueError) as exc:
+        raise SchemaError("num_rows must be an integer") from exc
+    if rows < 1:
+        raise SchemaError("num_rows must be at least 1")
+    if rows > MAX_ROWS:
+        raise SchemaError(f"num_rows must not exceed {MAX_ROWS}")
+    return schema
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", default_schema=DEFAULT_SCHEMA)
+
+
+@app.route("/preview", methods=["POST"])
+def preview():
+    """Return a small preview of the data in the requested format."""
+    try:
+        schema = _validate_schema(request.get_json(silent=True))
+    except SchemaError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        data = generate_data(schema, MAX_PREVIEW_ROWS)
+        fmt = schema["format"].upper()
+        if fmt in ("CSV", "EXCEL"):
             field_names = [field["name"] for field in schema["fields"]]
             return jsonify({"data": data, "field_order": field_names}), 200
-        
-        # For other formats, return formatted text
-        if format_type == "JSON":
-            return format_json(data), 200, {'Content-Type': 'text/plain'}
-        elif format_type == "XML":
-            return format_xml(data), 200, {'Content-Type': 'text/plain'}
-        elif format_type == "SQL":
-            return format_sql(data), 200, {'Content-Type': 'text/plain'}
-        else:
-            return jsonify({"error": f"Unsupported format: {format_type}"}), 400
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-@app.route('/generate', methods=['POST'])
+        formatter = FORMATTERS[fmt]["format"]
+        return formatter(data), 200, {"Content-Type": "text/plain"}
+    except SchemaError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        logger.exception("Unexpected error generating preview")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/generate", methods=["POST"])
 def generate():
-    """Generate mock data based on the provided schema and format it for download.
-    
-    Supports CSV, JSON, XML, SQL, and Excel formats.
-    """
+    """Generate the full dataset and stream it back as a file download."""
     try:
-        schema = request.json
-        if not schema or "fields" not in schema or "num_rows" not in schema or "format" not in schema:
-            return jsonify({"error": "Invalid schema format"}), 400
+        schema = _validate_schema(request.get_json(silent=True))
+    except SchemaError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-        # If preview mode (legacy support), return JSON data
-        if request.args.get('preview') == 'true':
+    try:
+        # Legacy `?preview=true` path — return JSON, no download.
+        if request.args.get("preview") == "true":
             data = generate_data(schema)
-            # Preserve field order from schema
             field_names = [field["name"] for field in schema["fields"]]
             return jsonify({"data": data, "field_order": field_names})
 
-        # Generate the data
         data = generate_data(schema)
-        format_type = schema["format"].upper()
-        
-        # Format data and prepare response based on format
-        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        if format_type == "CSV":
-            output = format_csv(data)
-            return send_file(
-                io.BytesIO(output.encode('utf-8')),
-                mimetype='text/csv',
-                as_attachment=True,
-                download_name=f'mock_data_{current_time}.csv'
-            )
-        elif format_type == "JSON":
-            output = format_json(data)
-            return send_file(
-                io.BytesIO(output.encode('utf-8')),
-                mimetype='application/json',
-                as_attachment=True,
-                download_name=f'mock_data_{current_time}.json'
-            )
-        elif format_type == "XML":
-            output = format_xml(data)
-            return send_file(
-                io.BytesIO(output.encode('utf-8')),
-                mimetype='application/xml',
-                as_attachment=True,
-                download_name=f'mock_data_{current_time}.xml'
-            )
-        elif format_type == "SQL":
-            output = format_sql(data)
-            return send_file(
-                io.BytesIO(output.encode('utf-8')),
-                mimetype='text/plain',
-                as_attachment=True,
-                download_name=f'mock_data_{current_time}.sql'
-            )
-        elif format_type == "EXCEL":
-            if not EXCEL_AVAILABLE:
-                return jsonify({"error": "Excel generation requires openpyxl. Please install it with 'pip install openpyxl'"}), 500
-                
-            output = format_excel(data)
-            return send_file(
-                io.BytesIO(output),
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name=f'mock_data_{current_time}.xlsx'
-            )
-        else:
-            return jsonify({"error": f"Unsupported format: {format_type}"}), 400
+        fmt = schema["format"].upper()
+        info = FORMATTERS[fmt]
+        output = info["format"](data)
+        if isinstance(output, str):
+            output = output.encode("utf-8")
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return send_file(
+            io.BytesIO(output or b""),
+            mimetype=info["mime"],
+            as_attachment=True,
+            download_name=f"mock_data_{timestamp}.{info['ext']}",
+        )
+    except SchemaError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        logger.exception("Unexpected error generating data")
+        return jsonify({"error": "Internal server error"}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True) 
+
+if __name__ == "__main__":
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug, host="127.0.0.1", port=int(os.getenv("PORT", "5000")))
