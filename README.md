@@ -1,38 +1,33 @@
 # Mock Data Factory
 
-> Schema-driven mock data generator. Build a schema in the browser, export to CSV · JSON · XML · SQL · Excel.
+> Schema-driven mock data generator with field templates and schema inference. CSV · JSON · XML · SQL · Excel.
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/flask-3.0-000?logo=flask)](https://flask.palletsprojects.com/)
-[![Tests](https://img.shields.io/badge/tests-32%20passing-1F6A3E)](./tests)
+[![Tests](https://img.shields.io/badge/tests-59%20passing-1F6A3E)](./tests)
 [![License](https://img.shields.io/badge/license-MIT-D94F1E)](#license)
 
 ```
-   ┌─────────────────────────────────────────────┐
-   │  SCHEMA                            FIELDS   │
-   │  ─────────────────────────────────────────  │
-   │  ::   id            ROW NUMBER          ×   │
-   │  ::   first_name    FIRST NAME          ×   │
-   │  ::   email         EMAIL ADDRESS  null:5%  │
-   │  + add field                                │
-   │  ─────────────────────────────────────────  │
-   │  ROWS  [ 1000 ]    FORMAT  [ CSV ▾ ]        │
-   │                            [PREVIEW][GEN]   │
-   └─────────────────────────────────────────────┘
+   ┌─────────────────────────────────────────────────────────┐
+   │  SCHEMA              [✨ INFER] [↑] [↓] [🔗]           │
+   │  ──────────────────────────────────────────────────     │
+   │  ::  id           ROW NUMBER                       ×    │
+   │  ::  first_name   FIRST NAME                       ×    │
+   │  ::  email        TEMPLATE   {{first_name|lower}}…  ×   │
+   │  + add another field                                    │
+   │  ──────────────────────────────────────────────────     │
+   │  ROWS  [ 1000 ]    FORMAT  [ CSV ▾ ]   [PREVIEW] [GEN] │
+   └─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Why
+## Highlights
 
-You need 10,000 rows of realistic-looking test data and you need them now. Open the page, pick fields, pick a format, download. No signup, no rate limits, no telemetry — runs on your own machine.
-
-## What's in the box
-
-- **15 data types**: row numbers, names, emails, phone, IP, city, country, dates, numbers, decimals, gender, custom lists.
-- **5 export formats**: CSV, JSON, XML, SQL (`CREATE TABLE` + `INSERT`), Excel (`.xlsx`).
-- **Per-field null modifier**: inject any percentage of nulls into any column.
-- **Drag-and-drop reordering**, live preview, light/dark theme.
+- **Schema inference** — paste a SQL `CREATE TABLE`, JSON sample, or TypeScript `interface` and we'll guess sensible field types.
+- **Field templates** — compose values from other fields with filters: `{{first_name|lower}}.{{last_name|lower}}@example.com`.
+- **Schema persistence** — auto-saves to `localStorage`, exports as JSON, and shares via copyable URL hash.
+- **15 data types**, **5 export formats**, per-field null modifier, drag-and-drop reordering, light/dark theme.
 - **DoS guardrails**: requests above `MOCK_DATA_MAX_ROWS` (default 100k) are rejected before allocation.
 
 ## Quick start
@@ -47,9 +42,9 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open <http://127.0.0.1:5000>.
+Open <http://127.0.0.1:5000>. (Use `PORT=5050` if macOS's AirPlay is hogging 5000.)
 
-### Configuration
+## Configuration
 
 | Variable             | Default  | Purpose                                              |
 | -------------------- | -------- | ---------------------------------------------------- |
@@ -57,26 +52,89 @@ Open <http://127.0.0.1:5000>.
 | `PORT`               | `5000`   | Port for the development server.                     |
 | `MOCK_DATA_MAX_ROWS` | `100000` | Hard cap on rows per request (DoS guard).            |
 
+## Features in detail
+
+### Field templates
+
+Add a `Template` field, then write a string that references other fields by `{{name}}`:
+
+```
+{{first_name|lower}}.{{last_name|lower}}@example.com
+```
+
+Filters chain with `|`:
+
+| Filter    | Effect                            | Example                          |
+| --------- | --------------------------------- | -------------------------------- |
+| `lower`   | lower-case                        | `Alice` → `alice`                |
+| `upper`   | upper-case                        | `alice` → `ALICE`                |
+| `title`   | Title Case                        | `alice doe` → `Alice Doe`        |
+| `slug`    | URL-safe lower-case               | `Hello World!` → `hello-world`   |
+| `nospace` | strip spaces                      | `Hello World` → `HelloWorld`     |
+| `initial` | first letter, upper-case          | `alice` → `A`                    |
+| `digits`  | digits only                       | `(415) 555-1212` → `4155551212`  |
+| `trim`    | strip leading/trailing whitespace |                                  |
+
+Template fields are resolved in a second pass after all other fields, so they can reference any field regardless of order.
+
+### Schema inference
+
+Click **✨ Infer** to paste a sample and have the schema generated for you. Three sources are recognized:
+
+**SQL DDL**
+```sql
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  first_name VARCHAR(100),
+  email VARCHAR(255),
+  balance DECIMAL(10, 2),
+  active BOOLEAN,
+  created_at TIMESTAMP
+);
+```
+
+**JSON sample**
+```json
+{"id": 1, "first_name": "Alice", "email": "alice@example.com", "born": "1990-01-01"}
+```
+(Arrays are accepted too — the first element is used as the sample.)
+
+**TypeScript interface**
+```ts
+interface User {
+  id: number;
+  firstName: string;
+  email: string;
+  active: boolean;
+  createdAt: Date;
+}
+```
+
+Column names are matched against heuristics (e.g. `*email*` → Email Address, `*_at` / `*date*` → Date, `*phone*` → Phone Number). Unknown columns fall back to the SQL/TS type.
+
+### Schema persistence
+
+- Every change auto-saves to `localStorage` (debounced).
+- **↓ Export** downloads the schema as `schema_YYYY-MM-DD.json`.
+- **↑ Import** loads any previously exported file.
+- **🔗 Share** copies a self-contained URL like `…/#s=eyJmaWVsZH…` — open it in any browser to restore the schema.
+
 ## API
 
-Two endpoints, both accept the same JSON schema.
+Three endpoints, all accept JSON.
 
 ### `POST /preview`
 
-Returns a sample (≤ 100 rows). For CSV/Excel returns `{data, field_order}` JSON; for JSON/XML/SQL returns the formatted text directly.
+Returns a sample (≤ 100 rows). CSV/Excel return `{data, field_order}`; JSON/XML/SQL return the formatted text directly.
 
 ```bash
 curl -s http://127.0.0.1:5000/preview \
   -H 'Content-Type: application/json' \
-  -d '{
-    "fields": [
-      {"name": "id",   "type": "Row Number"},
-      {"name": "name", "type": "Full Name"},
-      {"name": "email","type": "Email Address", "blank_percentage": 10}
-    ],
-    "num_rows": 5,
-    "format": "JSON"
-  }'
+  -d '{"fields":[
+        {"name":"first","type":"First Name"},
+        {"name":"email","type":"Template",
+         "template":"{{first|lower}}@example.com"}
+      ],"num_rows":3,"format":"JSON"}'
 ```
 
 ### `POST /generate`
@@ -89,6 +147,24 @@ curl -OJ http://127.0.0.1:5000/generate \
   -d '{"fields":[{"name":"id","type":"Row Number"}],"num_rows":1000,"format":"CSV"}'
 ```
 
+### `POST /infer-schema`
+
+Infers field list from a SQL DDL, JSON sample, or TypeScript interface.
+
+```bash
+curl -s http://127.0.0.1:5000/infer-schema \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"sql","source":"CREATE TABLE u (id INT, email TEXT);"}'
+```
+
+Response:
+```json
+{"fields": [
+  {"name": "id",    "type": "Row Number"},
+  {"name": "email", "type": "Email Address"}
+]}
+```
+
 ### Schema reference
 
 ```jsonc
@@ -96,6 +172,7 @@ curl -OJ http://127.0.0.1:5000/generate \
   "fields": [
     {"name": "<column_name>", "type": "<data_type>",
      "values": ["a","b"],          // required when type == "Custom List"
+     "template": "{{x|lower}}",    // required when type == "Template"
      "blank_percentage": 0          // optional, 0-100, nulls % of values
     }
   ],
@@ -108,12 +185,12 @@ curl -OJ http://127.0.0.1:5000/generate \
 
 ```
 .
-├── app.py                  Flask app · generators · formatters · validation
+├── app.py                  Flask app · generators · formatters · templates · inference
 ├── templates/index.html    Single-page UI shell (Jinja-rendered)
 ├── static/
-│   ├── css/main.css        Blueprint-aesthetic theme + layout
-│   └── js/app.js           Schema editor · preview · download flow
-├── tests/test_app.py       pytest suite — 32 tests
+│   ├── css/main.css        Warm editorial theme
+│   └── js/app.js           Schema editor · persistence · preview · download
+├── tests/test_app.py       pytest suite — 59 tests
 ├── requirements.txt        Runtime dependencies
 ├── pyproject.toml          pytest + ruff config
 └── README.md
@@ -123,30 +200,22 @@ curl -OJ http://127.0.0.1:5000/generate \
 
 ```bash
 pip install pytest ruff
-pytest                   # 32 tests in ~1s
+pytest                   # 59 tests in ~1s
 ruff check .             # lint
 ```
 
 ## Production deployment
-
-The app is a standard Flask WSGI application — host anywhere Python runs.
 
 ```bash
 pip install gunicorn
 gunicorn -w 2 -b 0.0.0.0:$PORT app:app
 ```
 
-Recommended hosts: **Render**, **Fly.io**, **Railway**, **Heroku**, or any VPS. Serverless platforms (Netlify Functions, Vercel Functions) are not a great fit — Faker has a cold-start cost and exported files can exceed function size/time limits.
+Recommended hosts: **Render**, **Fly.io**, **Railway**, **Heroku**, or any VPS.
 
 ## Design
 
-The UI is intentionally not a Bootstrap default. It uses an industrial-blueprint aesthetic:
-
-- **Typography**: `Instrument Serif` italic for the display, `Geist` for body, `Geist Mono` for labels and field names.
-- **Palette**: warm paper background, deep ink, single safety-orange accent for the primary CTA.
-- **Geometry**: sharp 90° corners, hairline rules, blueprint grid background.
-
-To remix the theme, edit the CSS variables at the top of `static/css/main.css`.
+Warm editorial aesthetic — `Fraunces` italic display + `Hanken Grotesk` body + `JetBrains Mono` code; cream paper background with terracotta accent and gentle radial gold/plum gradients. To remix the theme, edit the CSS variables at the top of `static/css/main.css`.
 
 ## License
 
