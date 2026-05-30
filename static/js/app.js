@@ -3,14 +3,18 @@
 const DATA_TYPES = [
     "Row Number", "First Name", "Last Name", "Full Name", "Email Address",
     "Gender", "IP Address v4", "Phone Number", "City", "Country", "Date",
-    "Number", "Decimal", "Custom List", "Blank/Null",
+    "Number", "Decimal", "Custom List", "Blank/Null", "Template",
 ];
 
 const FORMAT_EXTENSIONS = {
     CSV: "csv", JSON: "json", XML: "xml", SQL: "sql", EXCEL: "xlsx",
 };
 
+const STORAGE_KEY = "mdf.schema.v1";
+const TEMPLATE_PLACEHOLDER = "{{first_name|lower}}.{{last_name|lower}}@example.com";
+
 let fieldCounter = 0;
+let restoring = false;
 
 const fieldList = document.getElementById("field-list");
 const addFieldBtn = document.getElementById("addFieldBtn");
@@ -19,15 +23,21 @@ const previewBtn = document.getElementById("previewBtn");
 const generateFromPreviewBtn = document.getElementById("generateFromPreviewBtn");
 const previewNumRows = document.getElementById("previewNumRows");
 const previewModalElement = document.getElementById("previewModal");
+const inferModalElement = document.getElementById("inferModal");
+const importFileInput = document.getElementById("importFileInput");
 
 new Sortable(fieldList, {
     animation: 150,
     handle: ".drag-handle",
     ghostClass: "sortable-ghost",
+    onEnd: () => persistSchema(),
 });
+
+// ---- Field rendering ------------------------------------------------------
 
 function suggestFieldName(typeName) {
     if (typeName === "Row Number") return "id";
+    if (typeName === "Template") return "computed";
     return typeName.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
 }
 
@@ -39,28 +49,38 @@ function buildFieldRow(fieldId, initial = {}) {
     const initialName = initial.name ?? suggestFieldName(initialType);
 
     fieldRow.innerHTML = `
-        <div class="drag-handle"></div>
+        <div class="drag-handle" title="Drag to reorder"></div>
         <div>
             <input type="text" class="form-control form-control-sm field-name"
                    id="${fieldId}-name" name="${fieldId}-name"
-                   placeholder="Field Name" required>
+                   placeholder="field_name" required autocomplete="off">
         </div>
-        <div>
+        <div class="field-input-stack">
             <select class="form-select form-select-sm data-type"
                     id="${fieldId}-type" name="${fieldId}-type">
                 ${DATA_TYPES.map(t => `<option value="${t}">${t}</option>`).join("")}
             </select>
             <input type="text" class="form-control form-control-sm custom-list-input"
                    id="${fieldId}-custom-list" name="${fieldId}-custom-list"
-                   placeholder="Comma-separated values">
+                   placeholder="value1, value2, value3">
             <input type="number" class="form-control form-control-sm blank-percentage-input"
                    id="${fieldId}-blank-percentage" name="${fieldId}-blank-percentage"
                    placeholder="Blank %" min="0" max="100">
+            <input type="text" class="form-control form-control-sm template-input"
+                   id="${fieldId}-template" name="${fieldId}-template"
+                   placeholder="${TEMPLATE_PLACEHOLDER}">
+            <div class="template-hint">
+                Reference other fields with <code>{{name}}</code>. Filters:
+                <code>lower</code>, <code>upper</code>, <code>title</code>,
+                <code>slug</code>, <code>nospace</code>, <code>initial</code>,
+                <code>digits</code>, <code>trim</code> — chain with <code>|</code>.
+            </div>
             <div class="blank-modifier">
-                <label for="${fieldId}-null-pct">Null %:</label>
+                <label for="${fieldId}-null-pct">null</label>
                 <input type="number" class="form-control form-control-sm null-modifier"
                        id="${fieldId}-null-pct" min="0" max="100" value="0"
-                       title="Percentage of values to leave null for this field">
+                       title="Percentage of values to leave null">
+                <span>%</span>
             </div>
         </div>
         <div class="remove-btn" data-field-id="${fieldId}" title="Remove field">
@@ -75,6 +95,16 @@ function buildFieldRow(fieldId, initial = {}) {
     const typeSelect = fieldRow.querySelector(".data-type");
     typeSelect.value = initialType;
 
+    if (initial.values && Array.isArray(initial.values)) {
+        fieldRow.querySelector(".custom-list-input").value = initial.values.join(", ");
+    }
+    if (initial.template) {
+        fieldRow.querySelector(".template-input").value = initial.template;
+    }
+    if (initial.blank_percentage != null) {
+        fieldRow.querySelector(".null-modifier").value = initial.blank_percentage;
+    }
+
     return fieldRow;
 }
 
@@ -83,24 +113,33 @@ function addField(initial = {}) {
     const fieldRow = buildFieldRow(fieldId, initial);
     fieldList.appendChild(fieldRow);
     handleDataTypeChange(fieldRow.querySelector(".data-type"));
+    if (!restoring) persistSchema();
 }
 
 function removeField(button) {
     button.closest(".field-row").remove();
+    persistSchema();
 }
 
 function handleDataTypeChange(select) {
     const fieldRow = select.closest(".field-row");
     const customListInput = fieldRow.querySelector(".custom-list-input");
     const blankPercentageInput = fieldRow.querySelector(".blank-percentage-input");
+    const templateInput = fieldRow.querySelector(".template-input");
+    const templateHint = fieldRow.querySelector(".template-hint");
 
     customListInput.style.display = "none";
     blankPercentageInput.style.display = "none";
+    templateInput.style.display = "none";
+    if (templateHint) templateHint.style.display = "none";
 
     if (select.value === "Custom List") {
         customListInput.style.display = "block";
     } else if (select.value === "Blank/Null") {
         blankPercentageInput.style.display = "block";
+    } else if (select.value === "Template") {
+        templateInput.style.display = "block";
+        if (templateHint) templateHint.style.display = "block";
     }
 }
 
@@ -143,9 +182,14 @@ function collectSchema(numRowsOverride) {
                 throw new Error(`Blank percentage for "${fieldName}" must be 0-100`);
             }
             field.blank_percentage = pct;
+        } else if (field.type === "Template") {
+            const template = row.querySelector(".template-input").value.trim();
+            if (!template) {
+                throw new Error(`Template field "${fieldName}" needs a template string`);
+            }
+            field.template = template;
         }
 
-        // Per-field null modifier (applies on top of any type).
         const nullPct = parseInt(row.querySelector(".null-modifier").value, 10) || 0;
         if (nullPct > 0) {
             if (nullPct > 100) {
@@ -166,6 +210,99 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// ---- Persistence ----------------------------------------------------------
+
+function getCurrentFields() {
+    try {
+        return collectSchema(1).fields;
+    } catch {
+        // Schema invalid (empty/missing data) — return whatever we can read.
+        return Array.from(document.querySelectorAll(".field-row")).map(row => ({
+            name: row.querySelector(".field-name")?.value || "",
+            type: row.querySelector(".data-type")?.value || "Row Number",
+        }));
+    }
+}
+
+let persistTimer = null;
+function persistSchema() {
+    if (restoring) return;
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+        try {
+            const fields = getCurrentFields();
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({ fields }));
+        } catch (err) {
+            console.warn("Failed to persist schema:", err);
+        }
+    }, 250);
+}
+
+function restoreSchema(fields) {
+    restoring = true;
+    try {
+        fieldList.innerHTML = "";
+        fields.forEach(f => addField(f));
+    } finally {
+        restoring = false;
+    }
+}
+
+function encodeSchemaForUrl(fields) {
+    const json = JSON.stringify({ fields });
+    return btoa(unescape(encodeURIComponent(json)))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function decodeSchemaFromUrl(encoded) {
+    const padded = encoded.replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(escape(atob(padded)));
+    return JSON.parse(json);
+}
+
+function copyShareUrl() {
+    const fields = getCurrentFields();
+    const encoded = encodeSchemaForUrl(fields);
+    const url = `${location.origin}${location.pathname}#s=${encoded}`;
+    navigator.clipboard.writeText(url).then(
+        () => showToast("Share URL copied to clipboard", "success"),
+        () => showToast("Could not copy to clipboard")
+    );
+}
+
+function exportSchema() {
+    const fields = getCurrentFields();
+    const blob = new Blob([JSON.stringify({ fields }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `schema_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    URL.revokeObjectURL(url);
+    a.remove();
+    showToast("Schema exported", "success");
+}
+
+function importSchemaFile(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        try {
+            const parsed = JSON.parse(e.target.result);
+            const fields = Array.isArray(parsed) ? parsed : parsed.fields;
+            if (!Array.isArray(fields) || fields.length === 0) {
+                throw new Error("File does not contain a fields array");
+            }
+            restoreSchema(fields);
+            persistSchema();
+            showToast(`Imported ${fields.length} field${fields.length === 1 ? "" : "s"}`, "success");
+        } catch (err) {
+            showToast(`Could not import: ${err.message}`);
+        }
+    };
+    reader.readAsText(file);
+}
+
 // ---- Toast helper ---------------------------------------------------------
 function showToast(message, variant = "danger") {
     const container = document.getElementById("toast-container");
@@ -182,7 +319,7 @@ function showToast(message, variant = "danger") {
         </div>
     `;
     container.appendChild(toastEl);
-    const toast = new bootstrap.Toast(toastEl, { delay: variant === "danger" ? 6000 : 3500 });
+    const toast = new bootstrap.Toast(toastEl, { delay: variant === "danger" ? 6000 : 3000 });
     toastEl.addEventListener("hidden.bs.toast", () => toastEl.remove());
     toast.show();
 }
@@ -230,6 +367,34 @@ async function postJson(path, body) {
         throw new Error(message);
     }
     return response;
+}
+
+// ---- Schema inference UI --------------------------------------------------
+async function runInfer() {
+    const activeTab = document.querySelector("#inferTabs .nav-link.active");
+    const kind = activeTab?.dataset.kind || "sql";
+    const source = document.getElementById(`infer-${kind}`).value;
+    if (!source.trim()) {
+        showToast("Paste some source first");
+        return;
+    }
+    const button = document.getElementById("inferParseBtn");
+    await withBusy(button, async () => {
+        try {
+            const response = await postJson("/infer-schema", { kind, source });
+            const { fields } = await response.json();
+            if (!fields || fields.length === 0) {
+                showToast("No fields recognized");
+                return;
+            }
+            restoreSchema(fields);
+            persistSchema();
+            bootstrap.Modal.getInstance(inferModalElement)?.hide();
+            showToast(`Inferred ${fields.length} field${fields.length === 1 ? "" : "s"}`, "success");
+        } catch (err) {
+            showToast(`Inference error: ${err.message}`);
+        }
+    });
 }
 
 // ---- Preview --------------------------------------------------------------
@@ -366,7 +531,6 @@ function applyTheme(theme) {
 
 // ---- Init -----------------------------------------------------------------
 document.addEventListener("DOMContentLoaded", () => {
-    // Clamp numeric inputs to >= 1.
     ["numRows", "previewNumRows"].forEach(id => {
         const el = document.getElementById(id);
         if (!el) return;
@@ -375,7 +539,6 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    // Modal cleanup: registered ONCE rather than per-preview to avoid listener leak.
     previewModalElement.addEventListener("hidden.bs.modal", () => {
         document.querySelectorAll(".modal-backdrop").forEach(b => b.remove());
         document.body.classList.remove("modal-open");
@@ -383,24 +546,81 @@ document.addEventListener("DOMContentLoaded", () => {
         document.body.style.paddingRight = "";
     });
 
-    // Initialize default rows (rendered by Jinja) — wire up handlers,
-    // mark pre-existing field names as user-edited so they survive type changes.
-    if (fieldList.children.length === 0) {
-        addField();
-    } else {
-        document.querySelectorAll(".field-row").forEach(row => {
-            const nameInput = row.querySelector(".field-name");
-            if (nameInput) nameInput.dataset.userEdited = "true";
-            handleDataTypeChange(row.querySelector(".data-type"));
-        });
+    // ---- Restore: URL hash takes precedence over localStorage ----
+    let restored = false;
+    const hashMatch = location.hash.match(/[#&]s=([^&]+)/);
+    if (hashMatch) {
+        try {
+            const parsed = decodeSchemaFromUrl(hashMatch[1]);
+            if (parsed.fields && parsed.fields.length) {
+                restoreSchema(parsed.fields);
+                showToast("Loaded schema from URL", "success");
+                restored = true;
+            }
+        } catch (err) {
+            console.warn("Bad hash schema:", err);
+        }
+    }
+    if (!restored) {
+        try {
+            const stored = localStorage.getItem(STORAGE_KEY);
+            if (stored) {
+                const parsed = JSON.parse(stored);
+                if (parsed.fields && parsed.fields.length) {
+                    restoreSchema(parsed.fields);
+                    restored = true;
+                }
+            }
+        } catch (err) {
+            console.warn("Bad stored schema:", err);
+        }
     }
 
+    if (!restored) {
+        if (fieldList.children.length === 0) {
+            addField();
+        } else {
+            document.querySelectorAll(".field-row").forEach(row => {
+                const nameInput = row.querySelector(".field-name");
+                if (nameInput) nameInput.dataset.userEdited = "true";
+                handleDataTypeChange(row.querySelector(".data-type"));
+            });
+        }
+    }
+
+    // Toolbar wiring
     addFieldBtn.addEventListener("click", () => addField());
     generateBtn.addEventListener("click", () => generateData(false));
     previewBtn.addEventListener("click", previewData);
     generateFromPreviewBtn.addEventListener("click", () => generateData(true));
 
-    // Event delegation: type change + name-edit tracking + remove.
+    document.getElementById("exportBtn")?.addEventListener("click", exportSchema);
+    document.getElementById("shareBtn")?.addEventListener("click", copyShareUrl);
+    document.getElementById("importBtn")?.addEventListener("click", () => importFileInput.click());
+    importFileInput?.addEventListener("change", (e) => {
+        if (e.target.files[0]) {
+            importSchemaFile(e.target.files[0]);
+            e.target.value = "";
+        }
+    });
+
+    document.getElementById("inferBtn")?.addEventListener("click", () => {
+        bootstrap.Modal.getOrCreateInstance(inferModalElement).show();
+    });
+    document.getElementById("inferParseBtn")?.addEventListener("click", runInfer);
+
+    // Tab switching in infer modal
+    document.querySelectorAll("#inferTabs .nav-link").forEach(tab => {
+        tab.addEventListener("click", (e) => {
+            e.preventDefault();
+            document.querySelectorAll("#inferTabs .nav-link").forEach(t => t.classList.remove("active"));
+            document.querySelectorAll(".infer-pane").forEach(p => p.classList.remove("active"));
+            tab.classList.add("active");
+            document.getElementById(`infer-pane-${tab.dataset.kind}`).classList.add("active");
+        });
+    });
+
+    // Field interactions
     fieldList.addEventListener("change", event => {
         if (event.target.classList.contains("data-type")) {
             const typeSelect = event.target;
@@ -408,16 +628,24 @@ document.addEventListener("DOMContentLoaded", () => {
             handleDataTypeChange(typeSelect);
 
             const nameInput = fieldRow?.querySelector(".field-name");
-            // Only overwrite the name if the user hasn't customized it.
             if (nameInput && nameInput.dataset.userEdited !== "true") {
                 nameInput.value = suggestFieldName(typeSelect.value);
             }
+            persistSchema();
         }
     });
 
     fieldList.addEventListener("input", event => {
-        if (event.target.classList.contains("field-name")) {
-            event.target.dataset.userEdited = "true";
+        const t = event.target;
+        if (t.classList.contains("field-name")) {
+            t.dataset.userEdited = "true";
+        }
+        if (t.classList.contains("field-name") ||
+            t.classList.contains("template-input") ||
+            t.classList.contains("custom-list-input") ||
+            t.classList.contains("null-modifier") ||
+            t.classList.contains("blank-percentage-input")) {
+            persistSchema();
         }
     });
 
@@ -426,7 +654,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (btn) removeField(btn);
     });
 
-    // Theme toggle.
+    // Theme
     const themeToggle = document.querySelector(".theme-toggle");
     themeToggle.addEventListener("click", () => {
         const isDark = document.body.classList.contains("theme-dark");

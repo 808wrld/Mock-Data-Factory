@@ -43,8 +43,23 @@
         <section class="card" aria-labelledby="schemaTitle">
             <header class="card-header">
                 <h2 class="card-title" id="schemaTitle"><em>Schema</em></h2>
-                <span class="card-meta">drag to reorder</span>
+                <div class="toolbar">
+                    <button type="button" class="tool-btn" id="inferBtn" title="Infer from SQL, JSON, or TypeScript">
+                        <i class="bi bi-magic"></i><span>Infer</span>
+                    </button>
+                    <button type="button" class="tool-btn" id="importBtn" title="Import schema JSON file">
+                        <i class="bi bi-upload"></i><span>Import</span>
+                    </button>
+                    <button type="button" class="tool-btn" id="exportBtn" title="Download schema as JSON">
+                        <i class="bi bi-download"></i><span>Export</span>
+                    </button>
+                    <button type="button" class="tool-btn" id="shareBtn" title="Copy a shareable URL">
+                        <i class="bi bi-link-45deg"></i><span>Share</span>
+                    </button>
+                </div>
             </header>
+
+            <input type="file" id="importFileInput" accept="application/json,.json" hidden>
 
             <div class="schema-header" role="row" aria-hidden="true">
                 <div></div>
@@ -70,7 +85,7 @@
                             name="field-init-{{ loop.index }}-type">
                             {% for type in ["Row Number", "First Name", "Last Name", "Full Name", "Email Address",
                             "Gender", "IP Address v4", "Phone Number", "City", "Country", "Date", "Number", "Decimal",
-                            "Custom List", "Blank/Null"] %}
+                            "Custom List", "Blank/Null", "Template"] %}
                             <option value="{{ type }}" {% if type==field.type %}selected{% endif %}>{{ type }}</option>
                             {% endfor %}
                         </select>
@@ -82,6 +97,16 @@
                             id="field-init-{{ loop.index }}-blank-percentage"
                             name="field-init-{{ loop.index }}-blank-percentage"
                             placeholder="Blank %" min="0" max="100">
+                        <input type="text" class="form-control form-control-sm template-input"
+                            id="field-init-{{ loop.index }}-template"
+                            name="field-init-{{ loop.index }}-template"
+                            placeholder="{{ '{' }}{{ '{' }}first_name|lower{{ '}' }}{{ '}' }}.{{ '{' }}{{ '{' }}last_name|lower{{ '}' }}{{ '}' }}@example.com">
+                        <div class="template-hint">
+                            Reference other fields with <code>{{ '{' }}{{ '{' }}name{{ '}' }}{{ '}' }}</code>. Filters:
+                            <code>lower</code>, <code>upper</code>, <code>title</code>,
+                            <code>slug</code>, <code>nospace</code>, <code>initial</code>,
+                            <code>digits</code>, <code>trim</code> — chain with <code>|</code>.
+                        </div>
                         <div class="blank-modifier">
                             <label for="field-init-{{ loop.index }}-null-pct">null</label>
                             <input type="number" class="form-control form-control-sm null-modifier"
@@ -131,6 +156,7 @@
             <span>Open source · MIT · <a href="https://github.com/808wrld/Mock-Data-Factory" target="_blank" rel="noopener">github.com/808wrld/mock-data-factory</a></span>
         </footer>
 
+        <!-- Preview modal -->
         <div class="modal fade" id="previewModal" tabindex="-1" aria-labelledby="previewModalLabel" aria-hidden="true">
             <div class="modal-dialog modal-xl modal-dialog-scrollable modal-dialog-centered">
                 <div class="modal-content">
@@ -154,6 +180,54 @@
                             <button type="button" class="btn btn-success btn-generate"
                                 id="generateFromPreviewBtn">Generate</button>
                         </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Infer modal -->
+        <div class="modal fade" id="inferModal" tabindex="-1" aria-labelledby="inferModalLabel" aria-hidden="true">
+            <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="inferModalLabel">Infer schema</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="infer-intro">
+                            Paste a <strong>CREATE TABLE</strong> statement, a JSON sample, or a
+                            TypeScript <strong>interface</strong> / <strong>type</strong> alias. We'll
+                            guess sensible field types and replace your current schema.
+                        </p>
+
+                        <ul class="nav infer-tabs" id="inferTabs">
+                            <li><a href="#" class="nav-link active" data-kind="sql">SQL DDL</a></li>
+                            <li><a href="#" class="nav-link" data-kind="json">JSON sample</a></li>
+                            <li><a href="#" class="nav-link" data-kind="typescript">TypeScript</a></li>
+                        </ul>
+
+                        <div class="infer-panes">
+                            <div class="infer-pane active" id="infer-pane-sql">
+                                <textarea class="form-control infer-textarea" id="infer-sql"
+                                    rows="10" spellcheck="false"
+                                    placeholder="CREATE TABLE users (&#10;  id INTEGER PRIMARY KEY,&#10;  first_name VARCHAR(100),&#10;  email VARCHAR(255),&#10;  created_at TIMESTAMP&#10;);"></textarea>
+                            </div>
+                            <div class="infer-pane" id="infer-pane-json">
+                                <textarea class="form-control infer-textarea" id="infer-json"
+                                    rows="10" spellcheck="false"
+                                    placeholder='{&#10;  "id": 1,&#10;  "first_name": "Alice",&#10;  "email": "alice@example.com",&#10;  "born": "1990-01-01"&#10;}'></textarea>
+                            </div>
+                            <div class="infer-pane" id="infer-pane-typescript">
+                                <textarea class="form-control infer-textarea" id="infer-typescript"
+                                    rows="10" spellcheck="false"
+                                    placeholder="interface User {&#10;  id: number;&#10;  firstName: string;&#10;  email: string;&#10;  active: boolean;&#10;  createdAt: Date;&#10;}"></textarea>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary me-auto"
+                            data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-success" id="inferParseBtn">Parse &amp; replace</button>
                     </div>
                 </div>
             </div>
