@@ -1052,13 +1052,46 @@ body.theme-dark .preview-table.table-striped > tbody > tr:nth-of-type(odd) > * {
     border-color: var(--primary) !important;
 }
 
-/* ---------- Theme switcher ---------------------------------------- */
+/* ---------- Header actions (lang + theme) ------------------------- */
 
-.theme-switcher {
+.header-actions {
     position: fixed;
     top: var(--s-4);
     right: var(--s-4);
     z-index: 1000;
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+}
+
+.lang-toggle {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    height: 2.5rem;
+    min-width: 2.5rem;
+    padding: 0 0.65rem;
+    border-radius: var(--r-pill);
+    cursor: pointer;
+    color: var(--ink-2);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    box-shadow: var(--shadow-sm);
+    transition: color 0.2s var(--ease-out),
+                background 0.2s var(--ease-out),
+                transform 0.2s var(--ease-out),
+                box-shadow 0.2s var(--ease-out);
+}
+
+.lang-toggle:hover {
+    color: var(--primary);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+}
+
+.lang-toggle:focus {
+    outline: none;
 }
 
 .theme-toggle {
@@ -1089,6 +1122,38 @@ body.theme-dark .preview-table.table-striped > tbody > tr:nth-of-type(odd) > * {
 
 .theme-toggle:focus {
     outline: none;
+}
+
+/* ---------- Chinese typography adjustments ------------------------ */
+
+body.lang-zh {
+    --font-body: "Hanken Grotesk", "Noto Sans SC", "PingFang SC",
+                 "Hiragino Sans GB", -apple-system, sans-serif;
+    --font-display: "Fraunces", "Noto Serif SC", "Songti SC", "Iowan Old Style",
+                    Georgia, serif;
+}
+
+/* Noto Serif SC has no italic, so don't oblique it for Chinese-only text. */
+body.lang-zh .modal-title,
+body.lang-zh .card-title em,
+body.lang-zh .footer-mark,
+body.lang-zh .header-tagline {
+    font-style: normal;
+}
+
+/* Brand title "Mock Data Factory" stays English Fraunces italic — leave alone. */
+
+body.lang-zh .header-tagline {
+    font-weight: 400;
+}
+
+body.lang-zh .header-eyebrow,
+body.lang-zh .header-meta,
+body.lang-zh .blank-modifier,
+body.lang-zh .control-group label,
+body.lang-zh .toolbar .tool-btn,
+body.lang-zh .infer-tabs .nav-link {
+    letter-spacing: 0.02em;
 }
 
 .theme-icon-light,
