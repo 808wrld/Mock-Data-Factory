@@ -21,6 +21,10 @@ from app import (  # noqa: E402
     format_xml,
     generate_data,
     generate_value,
+    infer_from_json,
+    infer_from_sql,
+    infer_from_typescript,
+    render_template_value,
 )
 
 
@@ -272,3 +276,234 @@ def test_generate_returns_excel_with_xlsx_extension(client, schema):
     response = client.post("/generate", json=schema)
     assert response.status_code == 200
     assert ".xlsx" in response.headers["Content-Disposition"]
+
+
+# ---- Template engine ------------------------------------------------------
+
+def test_render_template_substitutes_simple_field():
+    assert render_template_value("hello {{name}}", {"name": "world"}) == "hello world"
+
+
+def test_render_template_with_filters():
+    row = {"first": "Jane", "last": "Doe"}
+    out = render_template_value("{{first|lower}}.{{last|lower}}@example.com", row)
+    assert out == "jane.doe@example.com"
+
+
+def test_render_template_chained_filters():
+    assert render_template_value("{{name|upper|trim}}", {"name": "  alice "}) == "ALICE"
+
+
+def test_render_template_initial_and_slug():
+    assert render_template_value("{{name|initial}}", {"name": "alice"}) == "A"
+    assert render_template_value("{{name|slug}}", {"name": "Hello World!"}) == "hello-world"
+
+
+def test_render_template_unknown_field_renders_empty():
+    assert render_template_value("X={{missing}}Y", {}) == "X=Y"
+
+
+def test_render_template_handles_none():
+    assert render_template_value("{{x|upper}}", {"x": None}) == ""
+
+
+def test_template_field_resolves_after_others():
+    schema = {
+        "fields": [
+            {"name": "first", "type": "First Name"},
+            {"name": "last", "type": "Last Name"},
+            {"name": "email", "type": "Template",
+             "template": "{{first|lower}}.{{last|lower}}@example.com"},
+        ],
+        "num_rows": 5,
+        "format": "JSON",
+    }
+    data = generate_data(schema)
+    for row in data:
+        assert row["email"].endswith("@example.com")
+        first = row["first"].lower()
+        last = row["last"].lower()
+        assert row["email"] == f"{first}.{last}@example.com"
+
+
+def test_template_field_with_blank_percentage():
+    schema = {
+        "fields": [
+            {"name": "first", "type": "First Name"},
+            {"name": "alias", "type": "Template",
+             "template": "{{first|upper}}", "blank_percentage": 100},
+        ],
+        "num_rows": 8,
+        "format": "JSON",
+    }
+    data = generate_data(schema)
+    assert all(row["alias"] is None for row in data)
+
+
+# ---- Schema inference: SQL ------------------------------------------------
+
+def test_infer_from_sql_extracts_columns():
+    sql = """
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        first_name VARCHAR(100),
+        email VARCHAR(255),
+        created_at TIMESTAMP,
+        balance DECIMAL(10,2),
+        active BOOLEAN
+    );
+    """
+    fields = infer_from_sql(sql)
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["id"]["type"] == "Row Number"
+    assert by_name["first_name"]["type"] == "First Name"
+    assert by_name["email"]["type"] == "Email Address"
+    assert by_name["created_at"]["type"] == "Date"
+    assert by_name["balance"]["type"] == "Decimal"
+    assert by_name["active"]["type"] == "Custom List"
+    assert by_name["active"]["values"] == ["true", "false"]
+
+
+def test_infer_from_sql_skips_constraints():
+    sql = """
+    CREATE TABLE t (
+        id INT,
+        name TEXT,
+        PRIMARY KEY (id),
+        UNIQUE (name)
+    );
+    """
+    fields = infer_from_sql(sql)
+    assert [f["name"] for f in fields] == ["id", "name"]
+
+
+def test_infer_from_sql_rejects_garbage():
+    with pytest.raises(SchemaError):
+        infer_from_sql("this is not sql")
+
+
+# ---- Schema inference: JSON -----------------------------------------------
+
+def test_infer_from_json_object():
+    src = '{"id": 1, "name": "Alice", "email": "a@b.com", "born": "1990-01-01"}'
+    fields = infer_from_json(src)
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["id"]["type"] == "Row Number"
+    assert by_name["name"]["type"] == "Full Name"
+    assert by_name["email"]["type"] == "Email Address"
+    assert by_name["born"]["type"] == "Date"
+
+
+def test_infer_from_json_array_uses_first_item():
+    src = '[{"price": 9.99, "qty": 3}, {"price": 1.0, "qty": 1}]'
+    fields = infer_from_json(src)
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["price"]["type"] == "Decimal"
+    assert by_name["qty"]["type"] == "Number"
+
+
+def test_infer_from_json_bool_to_custom_list():
+    fields = infer_from_json('{"active": true}')
+    assert fields[0]["type"] == "Custom List"
+    assert fields[0]["values"] == ["true", "false"]
+
+
+def test_infer_from_json_detects_ipv4():
+    fields = infer_from_json('{"client_addr": "192.168.1.1"}')
+    assert fields[0]["type"] == "IP Address v4"
+
+
+def test_infer_from_json_rejects_invalid():
+    with pytest.raises(SchemaError):
+        infer_from_json("not json")
+
+
+def test_infer_from_json_rejects_empty_array():
+    with pytest.raises(SchemaError):
+        infer_from_json("[]")
+
+
+# ---- Schema inference: TypeScript -----------------------------------------
+
+def test_infer_from_typescript_interface():
+    src = """
+    interface User {
+        id: number;
+        email: string;
+        firstName: string;
+        active: boolean;
+        createdAt: Date;
+    }
+    """
+    fields = infer_from_typescript(src)
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["id"]["type"] == "Row Number"
+    assert by_name["email"]["type"] == "Email Address"
+    assert by_name["firstName"]["type"] == "First Name"
+    assert by_name["active"]["type"] == "Custom List"
+    assert by_name["createdAt"]["type"] == "Date"
+
+
+def test_infer_from_typescript_handles_type_alias():
+    src = "type Product = { id: number; name: string; price: number; };"
+    fields = infer_from_typescript(src)
+    assert [f["name"] for f in fields] == ["id", "name", "price"]
+
+
+def test_infer_from_typescript_optional_fields():
+    src = "interface X { foo?: string; bar: number; }"
+    fields = infer_from_typescript(src)
+    assert [f["name"] for f in fields] == ["foo", "bar"]
+
+
+def test_infer_from_typescript_rejects_garbage():
+    with pytest.raises(SchemaError):
+        infer_from_typescript("function foo() {}")
+
+
+# ---- /infer-schema endpoint -----------------------------------------------
+
+def test_infer_endpoint_sql(client):
+    response = client.post("/infer-schema", json={
+        "kind": "sql",
+        "source": "CREATE TABLE t (id INT, email VARCHAR(100));",
+    })
+    assert response.status_code == 200
+    fields = response.get_json()["fields"]
+    assert any(f["name"] == "email" and f["type"] == "Email Address" for f in fields)
+
+
+def test_infer_endpoint_json(client):
+    response = client.post("/infer-schema", json={
+        "kind": "json",
+        "source": '{"name": "x", "email": "a@b.com"}',
+    })
+    assert response.status_code == 200
+    fields = response.get_json()["fields"]
+    assert {f["name"] for f in fields} == {"name", "email"}
+
+
+def test_infer_endpoint_typescript(client):
+    response = client.post("/infer-schema", json={
+        "kind": "typescript",
+        "source": "interface X { name: string; }",
+    })
+    assert response.status_code == 200
+
+
+def test_infer_endpoint_rejects_unknown_kind(client):
+    response = client.post("/infer-schema", json={"kind": "yaml", "source": "foo"})
+    assert response.status_code == 400
+
+
+def test_infer_endpoint_rejects_empty_source(client):
+    response = client.post("/infer-schema", json={"kind": "sql", "source": "  "})
+    assert response.status_code == 400
+
+
+def test_infer_endpoint_rejects_oversize_source(client):
+    response = client.post("/infer-schema", json={
+        "kind": "json",
+        "source": "x" * 40000,
+    })
+    assert response.status_code == 400

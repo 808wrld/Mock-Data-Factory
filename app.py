@@ -2,6 +2,9 @@
 
 Generates realistic mock data based on a user-supplied schema and exports it
 as CSV, JSON, XML, SQL, or Excel.
+
+Supports inter-field templates (e.g. `{{first_name|lower}}.{{last_name|lower}}@example.com`)
+and schema inference from SQL DDL, JSON samples, or TypeScript interfaces.
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import xml.dom.minidom
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -28,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Hard cap to protect against memory exhaustion / DoS.
 MAX_ROWS = int(os.getenv("MOCK_DATA_MAX_ROWS", "100000"))
 MAX_PREVIEW_ROWS = 100
+MAX_INFER_SOURCE = 32_000  # ~32KB of source text for inference
 
 DEFAULT_SCHEMA = [
     {"name": "id", "type": "Row Number"},
@@ -44,6 +49,8 @@ SUPPORTED_FORMATS = {"CSV", "JSON", "XML", "SQL", "EXCEL"}
 class SchemaError(ValueError):
     """Raised for any user-facing schema validation failure."""
 
+
+# ---------- Generators ---------------------------------------------------
 
 def _date_within_last_five_years(_config: dict | None = None) -> str:
     start = datetime.now() - timedelta(days=365 * 5)
@@ -73,9 +80,9 @@ GENERATORS: dict[str, Callable[[dict | None], Any]] = {
     "Number": lambda _c: random.randint(1, 1000),
     "Decimal": lambda _c: round(random.uniform(0, 1000), 2),
     "Custom List": _custom_list,
-    # Legacy "Blank/Null" type — kept for backward compatibility with old
-    # client schemas. Prefer the per-field "blank_percentage" modifier now.
     "Blank/Null": lambda c: None if random.random() < ((c or {}).get("blank_percentage", 0) / 100) else fake.word(),
+    # Template values are filled in a second pass after all other fields exist.
+    "Template": lambda _c: None,
 }
 
 
@@ -84,6 +91,62 @@ def generate_value(field_type: str, field_config: dict | None = None) -> Any:
     gen = GENERATORS.get(field_type)
     return gen(field_config) if gen else ""
 
+
+# ---------- Template engine ---------------------------------------------
+
+_TEMPLATE_TOKEN = re.compile(r"\{\{\s*([^}|\s]+)\s*(?:\|\s*([^}]+?)\s*)?\}\}")
+
+
+def _filter_slug(value: str) -> str:
+    return re.sub(r"\W+", "-", str(value)).strip("-").lower()
+
+
+def _filter_initial(value: str) -> str:
+    s = str(value).strip()
+    return s[0].upper() if s else ""
+
+
+def _filter_digits(value: str) -> str:
+    return re.sub(r"\D", "", str(value))
+
+
+TEMPLATE_FILTERS: dict[str, Callable[[Any], Any]] = {
+    "lower": lambda v: str(v).lower(),
+    "upper": lambda v: str(v).upper(),
+    "title": lambda v: str(v).title(),
+    "slug": _filter_slug,
+    "nospace": lambda v: str(v).replace(" ", ""),
+    "initial": _filter_initial,
+    "digits": _filter_digits,
+    "trim": lambda v: str(v).strip(),
+}
+
+
+def render_template_value(template: str, row: dict[str, Any]) -> str:
+    """Replace `{{field|filter}}` tokens in `template` using values from `row`.
+
+    Unknown fields render as empty strings; unknown filters are ignored.
+    """
+    if not template:
+        return ""
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        filter_chain = match.group(2)
+        value = row.get(name, "")
+        if value is None:
+            value = ""
+        if filter_chain:
+            for fname in (f.strip() for f in filter_chain.split("|")):
+                fn = TEMPLATE_FILTERS.get(fname)
+                if fn:
+                    value = fn(value)
+        return str(value)
+
+    return _TEMPLATE_TOKEN.sub(replace, template)
+
+
+# ---------- Core generation ---------------------------------------------
 
 def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
     """Generate rows for the schema. `max_rows` (if provided) caps row count."""
@@ -96,25 +159,40 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
 
     fields = schema["fields"]
     data: list[dict] = []
-    # Python 3.7+ dicts preserve insertion order, so iterating `fields`
-    # already produces a deterministic column order.
+
     for i in range(num_rows):
         row: dict[str, Any] = {}
+        # Pass 1 — non-template fields.
         for field in fields:
+            if field["type"] == "Template":
+                row[field["name"]] = None
+                continue
             value = generate_value(field["type"], field)
             if field["type"] == "Row Number":
                 value = i + 1
-            # Per-field blank modifier (works for any type, not just Blank/Null).
             blank_pct = field.get("blank_percentage")
             if blank_pct and random.random() < (blank_pct / 100):
                 value = None
             row[field["name"]] = value
+
+        # Pass 2 — templates can reference any other field.
+        for field in fields:
+            if field["type"] != "Template":
+                continue
+            template = field.get("template", "") or ""
+            value = render_template_value(template, row)
+            blank_pct = field.get("blank_percentage")
+            if blank_pct and random.random() < (blank_pct / 100):
+                value = None
+            row[field["name"]] = value
+
         data.append(row)
     return data
 
 
+# ---------- Formatters --------------------------------------------------
+
 def format_csv(data: list[dict]) -> str:
-    """Render data as a CSV string."""
     output = io.StringIO()
     if data:
         writer = csv.DictWriter(output, fieldnames=list(data[0].keys()))
@@ -124,12 +202,10 @@ def format_csv(data: list[dict]) -> str:
 
 
 def format_json(data: list[dict]) -> str:
-    """Render data as a JSON string."""
     return json.dumps(data, indent=2)
 
 
 def format_xml(data: list[dict]) -> str:
-    """Render data as a pretty-printed XML string."""
     root = ET.Element("records")
     for item in data:
         record = ET.SubElement(root, "record")
@@ -139,19 +215,16 @@ def format_xml(data: list[dict]) -> str:
 
     xml_bytes = ET.tostring(root, encoding="utf-8")
     pretty = xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent="  ")
-    # Strip the <?xml ... ?> declaration line.
     if pretty.startswith("<?xml"):
         pretty = "\n".join(pretty.splitlines()[1:])
     return pretty
 
 
 def _infer_sql_type(column: str, data: list[dict]) -> str:
-    """Detect the SQL column type from the first non-null value in the column."""
     for row in data:
         value = row.get(column)
         if value is None:
             continue
-        # bool is a subclass of int — exclude it to avoid surprising INTEGER columns.
         if isinstance(value, bool):
             return "INTEGER"
         if isinstance(value, int):
@@ -169,7 +242,6 @@ def _infer_sql_type(column: str, data: list[dict]) -> str:
 
 
 def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
-    """Render data as a CREATE TABLE + INSERT script."""
     if not data:
         return ""
 
@@ -205,7 +277,6 @@ def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
 
 
 def format_excel(data: list[dict]) -> bytes | None:
-    """Render data as an .xlsx byte string."""
     if not data:
         return None
 
@@ -221,7 +292,6 @@ def format_excel(data: list[dict]) -> bytes | None:
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font = bold
 
-    # Single pass: write data and track max width simultaneously.
     for row_idx, row_data in enumerate(data, 2):
         for col_idx, header in enumerate(headers, 1):
             value = row_data[header]
@@ -252,8 +322,9 @@ FORMATTERS: dict[str, dict] = {
 }
 
 
+# ---------- Schema validation -------------------------------------------
+
 def _validate_schema(schema: Any) -> dict:
-    """Validate the incoming schema, raising SchemaError on any issue."""
     if not isinstance(schema, dict):
         raise SchemaError("Schema must be a JSON object")
     for key in ("fields", "num_rows", "format"):
@@ -275,6 +346,231 @@ def _validate_schema(schema: Any) -> dict:
     return schema
 
 
+# ---------- Schema inference --------------------------------------------
+
+# Order matters — first match wins. Use word-boundary or anchored patterns
+# to avoid e.g. "address" matching "ip_address" before the IP rule kicks in.
+NAME_HEURISTICS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?i)^(id|.*_id|.*Id)$"), "Row Number"),
+    (re.compile(r"(?i)e?_?mail"), "Email Address"),
+    (re.compile(r"(?i)ip[\-_]?address|^ip$|ipv4"), "IP Address v4"),
+    (re.compile(r"(?i)phone|tel(ephone)?|mobile|cell"), "Phone Number"),
+    (re.compile(r"(?i)(first|given|fore).?name|fname"), "First Name"),
+    (re.compile(r"(?i)(last|sur|family).?name|lname"), "Last Name"),
+    (re.compile(r"(?i)full[_\-]?name|^name$|display[_\-]?name|^user[_\-]?name$"), "Full Name"),
+    (re.compile(r"(?i)gender|sex"), "Gender"),
+    (re.compile(r"(?i)city|town"), "City"),
+    (re.compile(r"(?i)country|nation"), "Country"),
+    (re.compile(r"(?i)created|updated|deleted|modified|date|time|birth|dob|timestamp"), "Date"),
+    (re.compile(r"(?i)price|amount|cost|salary|balance|total|decimal|rate"), "Decimal"),
+    (re.compile(r"(?i)count|qty|quantity|number|age|rank|score|year"), "Number"),
+]
+
+
+def _name_to_type(name: str, fallback: str = "Full Name") -> str:
+    for pattern, dtype in NAME_HEURISTICS:
+        if pattern.search(name):
+            return dtype
+    return fallback
+
+
+def _sql_type_to_default(sql_type: str) -> str:
+    """Coarse fallback when name heuristics don't match — keyed off the SQL type."""
+    t = sql_type.upper()
+    if any(x in t for x in ("INT", "SERIAL", "BIGINT", "SMALLINT")):
+        return "Number"
+    if any(x in t for x in ("DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL", "MONEY")):
+        return "Decimal"
+    if any(x in t for x in ("DATE", "TIME", "TIMESTAMP")):
+        return "Date"
+    if any(x in t for x in ("BOOL", "BIT")):
+        return "Custom List"
+    return "Full Name"
+
+
+def _ts_type_to_default(ts_type: str) -> str:
+    t = ts_type.strip().rstrip(";").strip()
+    if t == "number":
+        return "Number"
+    if t == "boolean":
+        return "Custom List"
+    if t == "Date":
+        return "Date"
+    return "Full Name"
+
+
+_CREATE_TABLE_RE = re.compile(
+    r"create\s+table\s+(?:if\s+not\s+exists\s+)?[`\"\[]?(\w+)[`\"\]]?\s*\(",
+    re.IGNORECASE,
+)
+_COLUMN_LINE_RE = re.compile(
+    r"^\s*[`\"\[]?(\w+)[`\"\]]?\s+([A-Za-z][A-Za-z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)",
+)
+
+
+def _extract_paren_body(source: str, open_paren_idx: int) -> str:
+    """Return the substring between matching parens starting at `open_paren_idx`."""
+    depth = 0
+    start = open_paren_idx + 1
+    for i in range(open_paren_idx, len(source)):
+        ch = source[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return source[start:i]
+    raise SchemaError("Unclosed parenthesis in CREATE TABLE")
+
+
+def infer_from_sql(source: str) -> list[dict]:
+    """Parse a CREATE TABLE statement and return a list of inferred fields."""
+    match = _CREATE_TABLE_RE.search(source)
+    if not match:
+        raise SchemaError("Could not find a CREATE TABLE statement")
+    # match.end() - 1 points to the opening "(" of the column list.
+    body = _extract_paren_body(source, match.end() - 1)
+
+    fields: list[dict] = []
+    depth = 0
+    buf: list[str] = []
+    raw_lines: list[str] = []
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            raw_lines.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        raw_lines.append("".join(buf))
+
+    skip_keywords = {"primary", "foreign", "unique", "constraint", "key", "check", "index"}
+
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line:
+            continue
+        first_word = line.split()[0].strip("`\"[]").lower() if line.split() else ""
+        if first_word in skip_keywords:
+            continue
+        m = _COLUMN_LINE_RE.match(line)
+        if not m:
+            continue
+        col_name = m.group(1)
+        sql_type = m.group(2)
+        fallback = _sql_type_to_default(sql_type)
+        dtype = _name_to_type(col_name, fallback)
+        field: dict[str, Any] = {"name": col_name, "type": dtype}
+        if dtype == "Custom List" and fallback == "Custom List":
+            field["values"] = ["true", "false"]
+        fields.append(field)
+
+    if not fields:
+        raise SchemaError("CREATE TABLE statement had no recognizable columns")
+    return fields
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _json_value_to_type(name: str, value: Any) -> dict:
+    if isinstance(value, bool):
+        return {"name": name, "type": "Custom List", "values": ["true", "false"]}
+    if isinstance(value, int):
+        return {"name": name, "type": _name_to_type(name, "Number")}
+    if isinstance(value, float):
+        return {"name": name, "type": _name_to_type(name, "Decimal")}
+    if value is None:
+        return {"name": name, "type": _name_to_type(name)}
+    if isinstance(value, str):
+        if _EMAIL_RE.match(value):
+            return {"name": name, "type": "Email Address"}
+        if _IPV4_RE.match(value):
+            return {"name": name, "type": "IP Address v4"}
+        if _DATE_RE.match(value):
+            return {"name": name, "type": "Date"}
+        return {"name": name, "type": _name_to_type(name)}
+    if isinstance(value, list):
+        return {"name": name, "type": _name_to_type(name)}
+    if isinstance(value, dict):
+        return {"name": name, "type": _name_to_type(name)}
+    return {"name": name, "type": "Full Name"}
+
+
+def infer_from_json(source: str) -> list[dict]:
+    """Parse a JSON object or array of objects and return inferred fields."""
+    try:
+        parsed = json.loads(source)
+    except json.JSONDecodeError as exc:
+        raise SchemaError(f"Invalid JSON: {exc.msg}") from exc
+
+    if isinstance(parsed, list):
+        if not parsed:
+            raise SchemaError("JSON array is empty")
+        sample = parsed[0]
+    else:
+        sample = parsed
+
+    if not isinstance(sample, dict):
+        raise SchemaError("JSON must be an object or an array of objects")
+
+    return [_json_value_to_type(k, v) for k, v in sample.items()]
+
+
+_TS_INTERFACE_RE = re.compile(
+    r"(?:interface|type)\s+\w+\s*=?\s*\{([^}]+)\}",
+    re.DOTALL,
+)
+_TS_FIELD_RE = re.compile(r"^\s*(\w+)\s*\??\s*:\s*(.+?)\s*$")
+
+
+def infer_from_typescript(source: str) -> list[dict]:
+    """Parse a single TypeScript interface or type alias and return inferred fields."""
+    match = _TS_INTERFACE_RE.search(source)
+    if not match:
+        raise SchemaError("Could not find a TypeScript interface or type")
+
+    # Split on semicolons OR newlines so single-line and multi-line bodies work.
+    body = match.group(1)
+    parts = re.split(r"[;\n]", body)
+
+    fields: list[dict] = []
+    for part in parts:
+        line = part.strip()
+        if not line or line.startswith("//"):
+            continue
+        m = _TS_FIELD_RE.match(line)
+        if not m:
+            continue
+        name, ts_type = m.group(1), m.group(2)
+        fallback = _ts_type_to_default(ts_type)
+        dtype = _name_to_type(name, fallback)
+        field: dict[str, Any] = {"name": name, "type": dtype}
+        if dtype == "Custom List" and fallback == "Custom List":
+            field["values"] = ["true", "false"]
+        fields.append(field)
+
+    if not fields:
+        raise SchemaError("Interface body had no recognizable fields")
+    return fields
+
+
+INFER_HANDLERS: dict[str, Callable[[str], list[dict]]] = {
+    "sql": infer_from_sql,
+    "json": infer_from_json,
+    "typescript": infer_from_typescript,
+    "ts": infer_from_typescript,
+}
+
+
+# ---------- Routes ------------------------------------------------------
+
 @app.route("/")
 def index():
     return render_template("index.html", default_schema=DEFAULT_SCHEMA)
@@ -282,7 +578,6 @@ def index():
 
 @app.route("/preview", methods=["POST"])
 def preview():
-    """Return a small preview of the data in the requested format."""
     try:
         schema = _validate_schema(request.get_json(silent=True))
     except SchemaError as exc:
@@ -306,14 +601,12 @@ def preview():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    """Generate the full dataset and stream it back as a file download."""
     try:
         schema = _validate_schema(request.get_json(silent=True))
     except SchemaError as exc:
         return jsonify({"error": str(exc)}), 400
 
     try:
-        # Legacy `?preview=true` path — return JSON, no download.
         if request.args.get("preview") == "true":
             data = generate_data(schema)
             field_names = [field["name"] for field in schema["fields"]]
@@ -338,6 +631,32 @@ def generate():
     except Exception:
         logger.exception("Unexpected error generating data")
         return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/infer-schema", methods=["POST"])
+def infer_schema():
+    """Infer a schema from SQL DDL, a JSON sample, or a TypeScript interface."""
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind", "")).lower().strip()
+    source = payload.get("source", "")
+    if not isinstance(source, str) or not source.strip():
+        return jsonify({"error": "Provide source text to infer from"}), 400
+    if len(source) > MAX_INFER_SOURCE:
+        return jsonify({"error": f"Source exceeds {MAX_INFER_SOURCE} characters"}), 400
+
+    handler = INFER_HANDLERS.get(kind)
+    if not handler:
+        return jsonify({"error": f"Unknown kind: {kind}. Use sql, json, or typescript."}), 400
+
+    try:
+        fields = handler(source)
+    except SchemaError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        logger.exception("Unexpected error inferring schema")
+        return jsonify({"error": "Internal server error"}), 500
+
+    return jsonify({"fields": fields}), 200
 
 
 if __name__ == "__main__":
