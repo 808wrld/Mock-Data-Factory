@@ -4,7 +4,8 @@
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/flask-3.0-000?logo=flask)](https://flask.palletsprojects.com/)
-[![Tests](https://img.shields.io/badge/tests-59%20passing-1F6A3E)](./tests)
+[![Tests](https://img.shields.io/badge/tests-72%20passing-1F6A3E)](./tests)
+[![i18n](https://img.shields.io/badge/i18n-EN%20·%20中-6F4A78)](#bilingual-ui)
 [![License](https://img.shields.io/badge/license-MIT-D94F1E)](#license)
 
 ```
@@ -27,8 +28,9 @@
 - **Schema inference** — paste a SQL `CREATE TABLE`, JSON sample, or TypeScript `interface` and we'll guess sensible field types.
 - **Field templates** — compose values from other fields with filters: `{{first_name|lower}}.{{last_name|lower}}@example.com`.
 - **Schema persistence** — auto-saves to `localStorage`, exports as JSON, and shares via copyable URL hash.
+- **Bilingual UI** — EN / 中 toggle in the top-right corner; auto-picks Chinese for `zh-*` browser locales.
 - **15 data types**, **5 export formats**, per-field null modifier, drag-and-drop reordering, light/dark theme.
-- **DoS guardrails**: requests above `MOCK_DATA_MAX_ROWS` (default 100k) are rejected before allocation.
+- **Safety caps**: `MOCK_DATA_MAX_ROWS` (default 100k) rows per request, 200 fields per schema, 256 KB request body, 32 KB inference source — anything over the limit is rejected with a clean 400/413.
 
 ## Quick start
 
@@ -119,6 +121,16 @@ Column names are matched against heuristics (e.g. `*email*` → Email Address, `
 - **↑ Import** loads any previously exported file.
 - **🔗 Share** copies a self-contained URL like `…/#s=eyJmaWVsZH…` — open it in any browser to restore the schema.
 
+### Bilingual UI
+
+The top-right **EN / 中** pill swaps every visible string between English and Simplified Chinese:
+
+- Static markup uses `data-i18n` / `data-i18n-placeholder` / `data-i18n-title` attributes; toggling rewalks the DOM.
+- Dynamic strings (toasts, validation errors, preview captions, data-type dropdown labels) go through a `t(key, vars)` helper.
+- Data-type `option.value`s stay English so the backend keeps a single canonical name — only the display text changes.
+- The brand word *Mock Data Factory* stays English (it's a wordmark). Chinese display text falls back to `Noto Serif SC` / `Noto Sans SC`.
+- Initial language: `localStorage` → browser locale (`zh-*` → Chinese) → English. Persisted under `mdf.lang.v1`.
+
 ## API
 
 Three endpoints, all accept JSON.
@@ -190,7 +202,7 @@ Response:
 ├── static/
 │   ├── css/main.css        Warm editorial theme
 │   └── js/app.js           Schema editor · persistence · preview · download
-├── tests/test_app.py       pytest suite — 59 tests
+├── tests/test_app.py       pytest suite — 72 tests
 ├── requirements.txt        Runtime dependencies
 ├── pyproject.toml          pytest + ruff config
 └── README.md
@@ -200,7 +212,7 @@ Response:
 
 ```bash
 pip install pytest ruff
-pytest                   # 59 tests in ~1s
+pytest                   # 72 tests in <1s
 ruff check .             # lint
 ```
 
