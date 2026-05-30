@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = int(os.getenv("MOCK_DATA_MAX_ROWS", "100000"))
 MAX_PREVIEW_ROWS = 100
 MAX_INFER_SOURCE = 32_000  # ~32KB of source text for inference
+MAX_FIELDS = 200            # cap field count per schema
+MAX_CONTENT_LENGTH = 256 * 1024  # 256KB request body cap
+
+# Reject oversized request bodies before Flask hands them to a route.
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
 DEFAULT_SCHEMA = [
     {"name": "id", "type": "Row Number"},
@@ -205,12 +210,26 @@ def format_json(data: list[dict]) -> str:
     return json.dumps(data, indent=2)
 
 
+_XML_NAME_INVALID = re.compile(r"[^A-Za-z0-9_\-.]")
+_XML_NAME_BAD_START = re.compile(r"^[^A-Za-z_]")
+
+
+def _sanitize_xml_name(name: str) -> str:
+    """Coerce a column name into a syntactically valid XML element name."""
+    if not name:
+        return "_field"
+    safe = _XML_NAME_INVALID.sub("_", name)
+    if _XML_NAME_BAD_START.match(safe):
+        safe = "_" + safe
+    return safe
+
+
 def format_xml(data: list[dict]) -> str:
     root = ET.Element("records")
     for item in data:
         record = ET.SubElement(root, "record")
         for key, value in item.items():
-            field = ET.SubElement(record, key)
+            field = ET.SubElement(record, _sanitize_xml_name(key))
             field.text = "" if value is None else str(value)
 
     xml_bytes = ET.tostring(root, encoding="utf-8")
@@ -332,6 +351,37 @@ def _validate_schema(schema: Any) -> dict:
             raise SchemaError(f"Schema missing required key: {key}")
     if not isinstance(schema["fields"], list) or not schema["fields"]:
         raise SchemaError("Schema must contain at least one field")
+    if len(schema["fields"]) > MAX_FIELDS:
+        raise SchemaError(f"Schema may contain at most {MAX_FIELDS} fields")
+
+    # Per-field shape check — keeps malformed input from reaching the
+    # generator (and turning into a 500).
+    for idx, field in enumerate(schema["fields"], 1):
+        if not isinstance(field, dict):
+            raise SchemaError(f"Field #{idx} must be an object")
+        name = field.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SchemaError(f"Field #{idx} requires a non-empty name")
+        ftype = field.get("type")
+        if not isinstance(ftype, str) or not ftype:
+            raise SchemaError(f'Field "{name}" requires a "type" string')
+        if ftype == "Custom List":
+            values = field.get("values")
+            if not isinstance(values, list) or not values:
+                raise SchemaError(f'Custom List field "{name}" needs a non-empty "values" list')
+        if ftype == "Template":
+            template = field.get("template")
+            if not isinstance(template, str) or not template.strip():
+                raise SchemaError(f'Template field "{name}" needs a "template" string')
+        pct = field.get("blank_percentage")
+        if pct is not None:
+            try:
+                pct_int = int(pct)
+            except (TypeError, ValueError) as exc:
+                raise SchemaError(f'blank_percentage on "{name}" must be an integer') from exc
+            if not 0 <= pct_int <= 100:
+                raise SchemaError(f'blank_percentage on "{name}" must be between 0 and 100')
+
     fmt = str(schema["format"]).upper()
     if fmt not in SUPPORTED_FORMATS:
         raise SchemaError(f"Unsupported format: {schema['format']}")
@@ -570,6 +620,11 @@ INFER_HANDLERS: dict[str, Callable[[str], list[dict]]] = {
 
 
 # ---------- Routes ------------------------------------------------------
+
+@app.errorhandler(413)
+def request_too_large(_e):
+    return jsonify({"error": f"Request body exceeds {MAX_CONTENT_LENGTH} bytes"}), 413
+
 
 @app.route("/")
 def index():
