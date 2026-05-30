@@ -46,8 +46,14 @@ venv.bak/
 .netlify/
 
 # Cursor specific
-..specstory/
+.specstory/
 .cursorindexingignore
+
+# Test/Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
 
 # Windsurf
 windsurf_deployment.yaml
