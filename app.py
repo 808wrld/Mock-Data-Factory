@@ -85,7 +85,7 @@ GENERATORS: dict[str, Callable[[dict | None], Any]] = {
     "Number": lambda _c: random.randint(1, 1000),
     "Decimal": lambda _c: round(random.uniform(0, 1000), 2),
     "Custom List": _custom_list,
-    "Blank/Null": lambda c: None if random.random() < ((c or {}).get("blank_percentage", 0) / 100) else fake.word(),
+    "Blank/Null": lambda c: None if random.random() < ((c or {}).get("blank_percentage", 0) / 100) else "",
     # Template values are filled in a second pass after all other fields exist.
     "Template": lambda _c: None,
 }
@@ -153,6 +153,14 @@ def render_template_value(template: str, row: dict[str, Any]) -> str:
 
 # ---------- Core generation ---------------------------------------------
 
+def _apply_blank_percentage(value: Any, field: dict) -> Any:
+    """Null out `value` with probability `field["blank_percentage"]` percent."""
+    blank_pct = field.get("blank_percentage")
+    if blank_pct and random.random() < (blank_pct / 100):
+        return None
+    return value
+
+
 def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
     """Generate rows for the schema. `max_rows` (if provided) caps row count."""
     requested = int(schema["num_rows"])
@@ -175,10 +183,7 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
             value = generate_value(field["type"], field)
             if field["type"] == "Row Number":
                 value = i + 1
-            blank_pct = field.get("blank_percentage")
-            if blank_pct and random.random() < (blank_pct / 100):
-                value = None
-            row[field["name"]] = value
+            row[field["name"]] = _apply_blank_percentage(value, field)
 
         # Pass 2 — templates can reference any other field.
         for field in fields:
@@ -186,10 +191,7 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
                 continue
             template = field.get("template", "") or ""
             value = render_template_value(template, row)
-            blank_pct = field.get("blank_percentage")
-            if blank_pct and random.random() < (blank_pct / 100):
-                value = None
-            row[field["name"]] = value
+            row[field["name"]] = _apply_blank_percentage(value, field)
 
         data.append(row)
     return data
