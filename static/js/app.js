@@ -449,11 +449,18 @@ function collectSchema(numRowsOverride) {
             field.template = template;
         }
 
+        // The null-modifier is a universal "sometimes leave this blank"
+        // control available on every field type. For Blank/Null fields,
+        // though, blank_percentage is already the field's own primary
+        // setting (collected above) — the null-modifier must not clobber
+        // it. Only apply the null-modifier when it's actually set, and
+        // only for field types where blank_percentage isn't already owned
+        // by a dedicated input.
         const nullPct = parseInt(row.querySelector(".null-modifier").value, 10) || 0;
-        if (nullPct > 0) {
-            if (nullPct > 100) {
-                throw new Error(t("error.null_range", { name: fieldName }));
-            }
+        if (nullPct > 100) {
+            throw new Error(t("error.null_range", { name: fieldName }));
+        }
+        if (nullPct > 0 && field.type !== "Blank/Null") {
             field.blank_percentage = nullPct;
         }
 
