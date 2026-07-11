@@ -304,64 +304,119 @@ function buildFieldRow(fieldId, initial = {}) {
     const initialName = initial.name ?? suggestFieldName(initialType);
     const labels = TYPE_LABELS[currentLang] || TYPE_LABELS.en;
 
-    fieldRow.innerHTML = `
-        <div class="drag-handle" title="${escapeHtml(t("btn.drag_handle"))}"
-             data-i18n-title="btn.drag_handle"></div>
-        <div>
-            <input type="text" class="form-control form-control-sm field-name"
-                   id="${fieldId}-name" name="${fieldId}-name"
-                   placeholder="${escapeHtml(t("schema.field_placeholder"))}"
-                   data-i18n-placeholder="schema.field_placeholder"
-                   required autocomplete="off">
-        </div>
-        <div class="field-input-stack">
-            <select class="form-select form-select-sm data-type"
-                    id="${fieldId}-type" name="${fieldId}-type">
-                ${DATA_TYPES.map(t => `<option value="${t}">${escapeHtml(labels[t] || t)}</option>`).join("")}
-            </select>
-            <input type="text" class="form-control form-control-sm custom-list-input"
-                   id="${fieldId}-custom-list" name="${fieldId}-custom-list"
-                   placeholder="${escapeHtml(t("schema.values_placeholder"))}"
-                   data-i18n-placeholder="schema.values_placeholder">
-            <input type="number" class="form-control form-control-sm blank-percentage-input"
-                   id="${fieldId}-blank-percentage" name="${fieldId}-blank-percentage"
-                   placeholder="${escapeHtml(t("schema.blank_placeholder"))}"
-                   data-i18n-placeholder="schema.blank_placeholder"
-                   min="0" max="100">
-            <input type="text" class="form-control form-control-sm template-input"
-                   id="${fieldId}-template" name="${fieldId}-template"
-                   placeholder="${escapeHtml(TEMPLATE_PLACEHOLDER)}">
-            <div class="template-hint" data-template-hint></div>
-            <div class="blank-modifier">
-                <label for="${fieldId}-null-pct" data-i18n="schema.null_label">${escapeHtml(t("schema.null_label"))}</label>
-                <input type="number" class="form-control form-control-sm null-modifier"
-                       id="${fieldId}-null-pct" min="0" max="100" value="0">
-                <span>%</span>
-            </div>
-        </div>
-        <div class="remove-btn" data-field-id="${fieldId}"
-             title="${escapeHtml(t("btn.remove_field"))}"
-             data-i18n-title="btn.remove_field">
-            <i class="bi bi-x-lg"></i>
-        </div>
-    `;
+    const dragHandle = document.createElement("div");
+    dragHandle.className = "drag-handle";
+    dragHandle.title = t("btn.drag_handle");
+    dragHandle.setAttribute("data-i18n-title", "btn.drag_handle");
+    fieldRow.appendChild(dragHandle);
 
-    const nameInput = fieldRow.querySelector(".field-name");
+    const nameWrap = document.createElement("div");
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "form-control form-control-sm field-name";
+    nameInput.id = `${fieldId}-name`;
+    nameInput.name = `${fieldId}-name`;
+    nameInput.placeholder = t("schema.field_placeholder");
+    nameInput.setAttribute("data-i18n-placeholder", "schema.field_placeholder");
+    nameInput.required = true;
+    nameInput.autocomplete = "off";
     nameInput.value = initialName;
     nameInput.dataset.userEdited = initial.name ? "true" : "false";
+    nameWrap.appendChild(nameInput);
+    fieldRow.appendChild(nameWrap);
 
-    const typeSelect = fieldRow.querySelector(".data-type");
+    const inputStack = document.createElement("div");
+    inputStack.className = "field-input-stack";
+
+    const typeSelect = document.createElement("select");
+    typeSelect.className = "form-select form-select-sm data-type";
+    typeSelect.id = `${fieldId}-type`;
+    typeSelect.name = `${fieldId}-type`;
+    DATA_TYPES.forEach(type => {
+        const option = document.createElement("option");
+        option.value = type;
+        option.textContent = labels[type] || type;
+        typeSelect.appendChild(option);
+    });
     typeSelect.value = initialType;
+    inputStack.appendChild(typeSelect);
 
+    const customListInput = document.createElement("input");
+    customListInput.type = "text";
+    customListInput.className = "form-control form-control-sm custom-list-input";
+    customListInput.id = `${fieldId}-custom-list`;
+    customListInput.name = `${fieldId}-custom-list`;
+    customListInput.placeholder = t("schema.values_placeholder");
+    customListInput.setAttribute("data-i18n-placeholder", "schema.values_placeholder");
     if (initial.values && Array.isArray(initial.values)) {
-        fieldRow.querySelector(".custom-list-input").value = initial.values.join(", ");
+        customListInput.value = initial.values.join(", ");
     }
+    inputStack.appendChild(customListInput);
+
+    const blankPercentageInput = document.createElement("input");
+    blankPercentageInput.type = "number";
+    blankPercentageInput.className = "form-control form-control-sm blank-percentage-input";
+    blankPercentageInput.id = `${fieldId}-blank-percentage`;
+    blankPercentageInput.name = `${fieldId}-blank-percentage`;
+    blankPercentageInput.placeholder = t("schema.blank_placeholder");
+    blankPercentageInput.setAttribute("data-i18n-placeholder", "schema.blank_placeholder");
+    blankPercentageInput.min = "0";
+    blankPercentageInput.max = "100";
+    inputStack.appendChild(blankPercentageInput);
+
+    const templateInput = document.createElement("input");
+    templateInput.type = "text";
+    templateInput.className = "form-control form-control-sm template-input";
+    templateInput.id = `${fieldId}-template`;
+    templateInput.name = `${fieldId}-template`;
+    templateInput.placeholder = TEMPLATE_PLACEHOLDER;
     if (initial.template) {
-        fieldRow.querySelector(".template-input").value = initial.template;
+        templateInput.value = initial.template;
     }
+    inputStack.appendChild(templateInput);
+
+    const templateHint = document.createElement("div");
+    templateHint.className = "template-hint";
+    templateHint.setAttribute("data-template-hint", "");
+    inputStack.appendChild(templateHint);
+
+    const blankModifier = document.createElement("div");
+    blankModifier.className = "blank-modifier";
+
+    const nullLabel = document.createElement("label");
+    nullLabel.setAttribute("for", `${fieldId}-null-pct`);
+    nullLabel.setAttribute("data-i18n", "schema.null_label");
+    nullLabel.textContent = t("schema.null_label");
+    blankModifier.appendChild(nullLabel);
+
+    const nullModifier = document.createElement("input");
+    nullModifier.type = "number";
+    nullModifier.className = "form-control form-control-sm null-modifier";
+    nullModifier.id = `${fieldId}-null-pct`;
+    nullModifier.min = "0";
+    nullModifier.max = "100";
+    nullModifier.setAttribute("value", "0");
     if (initial.blank_percentage != null) {
-        fieldRow.querySelector(".null-modifier").value = initial.blank_percentage;
+        nullModifier.value = initial.blank_percentage;
     }
+    blankModifier.appendChild(nullModifier);
+
+    const percentSpan = document.createElement("span");
+    percentSpan.textContent = "%";
+    blankModifier.appendChild(percentSpan);
+
+    inputStack.appendChild(blankModifier);
+    fieldRow.appendChild(inputStack);
+
+    const removeBtn = document.createElement("div");
+    removeBtn.className = "remove-btn";
+    removeBtn.dataset.fieldId = fieldId;
+    removeBtn.title = t("btn.remove_field");
+    removeBtn.setAttribute("data-i18n-title", "btn.remove_field");
+    const removeIcon = document.createElement("i");
+    removeIcon.className = "bi bi-x-lg";
+    removeBtn.appendChild(removeIcon);
+    fieldRow.appendChild(removeBtn);
 
     return fieldRow;
 }
