@@ -199,6 +199,20 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
 
 # ---------- Formatters --------------------------------------------------
 
+def _column_order(data: list[dict]) -> list[str]:
+    """Return field names in schema order, taken from the first row.
+
+    All rows share the same keys (generate_data always emits every field),
+    so the first row's key order is authoritative for every formatter.
+    """
+    return list(data[0].keys())
+
+
+def _stringify_value(value: Any) -> str:
+    """Render a value as export text: None becomes an empty string."""
+    return "" if value is None else str(value)
+
+
 # Leading characters that spreadsheet apps (Excel, Sheets, LibreOffice)
 # interpret as the start of a formula. A string value starting with one of
 # these gets prefixed with a single quote so it's treated as literal text.
@@ -219,7 +233,7 @@ def _sanitize_row_for_export(row: dict) -> dict:
 def format_csv(data: list[dict]) -> str:
     output = io.StringIO()
     if data:
-        writer = csv.DictWriter(output, fieldnames=list(data[0].keys()))
+        writer = csv.DictWriter(output, fieldnames=_column_order(data))
         writer.writeheader()
         writer.writerows(_sanitize_row_for_export(row) for row in data)
     return output.getvalue()
@@ -249,7 +263,7 @@ def format_xml(data: list[dict]) -> str:
         record = ET.SubElement(root, "record")
         for key, value in item.items():
             field = ET.SubElement(record, _sanitize_xml_name(key))
-            field.text = "" if value is None else str(value)
+            field.text = _stringify_value(value)
 
     xml_bytes = ET.tostring(root, encoding="utf-8")
     pretty = xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent="  ")
@@ -294,7 +308,7 @@ def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
     if not data:
         return ""
 
-    columns = list(data[0].keys())
+    columns = _column_order(data)
     quoted_table = _quote_sql_identifier(table_name)
     lines = [
         "-- SQL Data Export",
@@ -334,7 +348,7 @@ def format_excel(data: list[dict]) -> bytes | None:
     ws = wb.active
     ws.title = "Mock Data"
 
-    headers = list(data[0].keys())
+    headers = _column_order(data)
     bold = openpyxl.styles.Font(bold=True)
     max_widths = [len(str(h)) for h in headers]
 
