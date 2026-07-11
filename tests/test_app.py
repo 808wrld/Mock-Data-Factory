@@ -382,6 +382,19 @@ def test_infer_from_sql_extracts_columns():
     assert by_name["active"]["values"] == ["true", "false"]
 
 
+def test_infer_from_sql_handles_multi_param_numeric_type():
+    # Regression: _COLUMN_LINE_RE used to allow at most two numeric params,
+    # so a type like NUMERIC(18,4,2) would fail to match the column line.
+    sql = """
+    CREATE TABLE t (
+        id INT,
+        amount NUMERIC(18,4,2)
+    );
+    """
+    fields = infer_from_sql(sql)
+    assert [f["name"] for f in fields] == ["id", "amount"]
+
+
 def test_infer_from_sql_skips_constraints():
     sql = """
     CREATE TABLE t (
