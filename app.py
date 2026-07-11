@@ -454,7 +454,7 @@ _CREATE_TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 _COLUMN_LINE_RE = re.compile(
-    r"^\s*[`\"\[]?(\w+)[`\"\]]?\s+([A-Za-z][A-Za-z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)",
+    r"^\s*[`\"\[]?(\w+)[`\"\]]?\s+([A-Za-z][A-Za-z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)*\))?)",
 )
 
 
