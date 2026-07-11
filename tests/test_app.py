@@ -173,10 +173,10 @@ def test_format_sql_uses_correct_column_types():
         {"id": 1, "price": 9.99, "name": "x", "created": "2024-01-01"},
     ]
     out = format_sql(data)
-    assert "id INTEGER" in out
-    assert "price REAL" in out
-    assert "name TEXT" in out
-    assert "created DATE" in out
+    assert '"id" INTEGER' in out
+    assert '"price" REAL' in out
+    assert '"name" TEXT' in out
+    assert '"created" DATE' in out
 
 
 def test_infer_sql_type_skips_leading_nulls():
@@ -188,13 +188,28 @@ def test_infer_sql_type_skips_leading_nulls():
 def test_format_sql_handles_bool_as_integer():
     data = [{"flag": True}, {"flag": False}]
     out = format_sql(data)
-    assert "flag INTEGER" in out
+    assert '"flag" INTEGER' in out
     assert "VALUES (1)" in out
     assert "VALUES (0)" in out
 
 
 def test_format_sql_empty():
     assert format_sql([]) == ""
+
+
+def test_format_sql_quotes_malicious_column_name():
+    # Regression: a field name containing SQL syntax must not break out of
+    # the identifier position in CREATE TABLE / INSERT.
+    data = [{'evil"); DROP TABLE users; --': "x"}]
+    out = format_sql(data)
+    assert '"evil""); DROP TABLE users; --" TEXT' in out
+    assert 'INSERT INTO "mock_data" ("evil""); DROP TABLE users; --")' in out
+
+
+def test_format_sql_quotes_table_name():
+    out = format_sql([{"a": 1}], table_name='t"); DROP TABLE users; --')
+    assert 'CREATE TABLE IF NOT EXISTS "t""); DROP TABLE users; --" (' in out
+    assert 'INSERT INTO "t""); DROP TABLE users; --"' in out
 
 
 # ---- _validate_schema -----------------------------------------------------

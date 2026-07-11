@@ -262,23 +262,35 @@ def _infer_sql_type(column: str, data: list[dict]) -> str:
     return "TEXT"
 
 
+def _quote_sql_identifier(name: str) -> str:
+    """Quote a SQL identifier (table or column name) for safe interpolation.
+
+    Field names are user-controlled; wrapping in double quotes and doubling
+    any embedded double quotes prevents identifier injection while staying
+    valid across common SQL dialects (SQLite, Postgres, standard SQL).
+    """
+    escaped = str(name).replace('"', '""')
+    return f'"{escaped}"'
+
+
 def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
     if not data:
         return ""
 
     columns = list(data[0].keys())
+    quoted_table = _quote_sql_identifier(table_name)
     lines = [
         "-- SQL Data Export",
         f"-- Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"CREATE TABLE IF NOT EXISTS {table_name} (",
+        f"CREATE TABLE IF NOT EXISTS {quoted_table} (",
     ]
-    column_defs = [f"    {col} {_infer_sql_type(col, data)}" for col in columns]
+    column_defs = [f"    {_quote_sql_identifier(col)} {_infer_sql_type(col, data)}" for col in columns]
     lines.append(",\n".join(column_defs))
     lines.append(");")
     lines.append("")
 
-    column_list = ", ".join(columns)
+    column_list = ", ".join(_quote_sql_identifier(col) for col in columns)
     for row in data:
         values = []
         for col in columns:
@@ -292,7 +304,7 @@ def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
             else:
                 escaped = str(value).replace("'", "''")
                 values.append(f"'{escaped}'")
-        lines.append(f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(values)});")
+        lines.append(f"INSERT INTO {quoted_table} ({column_list}) VALUES ({', '.join(values)});")
 
     return "\n".join(lines)
 
