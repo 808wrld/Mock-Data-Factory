@@ -127,6 +127,24 @@ def test_blank_percentage_modifier_produces_nulls():
     assert all(row["name"] is None for row in data)
 
 
+def test_blank_null_type_is_empty_string_when_not_nulled():
+    # Regression: Blank/Null used to fall back to a random fake word when a
+    # row wasn't chosen for blanking, so the column was never truly blank.
+    config = {"blank_percentage": 0}
+    for _ in range(20):
+        assert generate_value("Blank/Null", config) == ""
+
+
+def test_blank_null_type_respects_blank_percentage():
+    schema = {
+        "fields": [{"name": "x", "type": "Blank/Null", "blank_percentage": 100}],
+        "num_rows": 10,
+        "format": "JSON",
+    }
+    data = generate_data(schema)
+    assert all(row["x"] is None for row in data)
+
+
 # ---- formatters -----------------------------------------------------------
 
 def test_format_csv_writes_header_and_rows():
