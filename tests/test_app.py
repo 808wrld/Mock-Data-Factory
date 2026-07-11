@@ -1,10 +1,12 @@
 """Tests for the Mock Data Factory app."""
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +21,7 @@ from app import (  # noqa: E402
     _validate_schema,
     app,
     format_csv,
+    format_excel,
     format_json,
     format_sql,
     format_xml,
@@ -158,6 +161,27 @@ def test_format_csv_writes_header_and_rows():
 
 def test_format_csv_empty():
     assert format_csv([]) == ""
+
+
+def test_format_csv_neutralizes_formula_injection():
+    # Values that spreadsheet apps would interpret as formulas must be
+    # prefixed with a single quote so they're imported as literal text.
+    data = [{"a": "=1+1", "b": "+cmd", "c": "-x", "d": "@x", "e": "safe", "f": 5}]
+    out = format_csv(data)
+    lines = out.strip().splitlines()
+    assert lines[1] == "'=1+1,'+cmd,'-x,'@x,safe,5"
+
+
+def test_format_excel_neutralizes_formula_injection():
+    data = [{"a": "=1+1", "b": "safe"}]
+    xlsx_bytes = format_excel(data)
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb.active
+    cell_a2 = ws.cell(row=2, column=1)
+    cell_b2 = ws.cell(row=2, column=2)
+    assert cell_a2.value == "'=1+1"
+    assert cell_a2.data_type == "s"  # stored as text, not formula ("f")
+    assert cell_b2.value == "safe"
 
 
 def test_format_json_is_parseable():
