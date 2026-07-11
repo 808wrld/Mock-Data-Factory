@@ -85,7 +85,7 @@ GENERATORS: dict[str, Callable[[dict | None], Any]] = {
     "Number": lambda _c: random.randint(1, 1000),
     "Decimal": lambda _c: round(random.uniform(0, 1000), 2),
     "Custom List": _custom_list,
-    "Blank/Null": lambda c: None if random.random() < ((c or {}).get("blank_percentage", 0) / 100) else fake.word(),
+    "Blank/Null": lambda c: None if random.random() < ((c or {}).get("blank_percentage", 0) / 100) else "",
     # Template values are filled in a second pass after all other fields exist.
     "Template": lambda _c: None,
 }
@@ -153,6 +153,14 @@ def render_template_value(template: str, row: dict[str, Any]) -> str:
 
 # ---------- Core generation ---------------------------------------------
 
+def _apply_blank_percentage(value: Any, field: dict) -> Any:
+    """Null out `value` with probability `field["blank_percentage"]` percent."""
+    blank_pct = field.get("blank_percentage")
+    if blank_pct and random.random() < (blank_pct / 100):
+        return None
+    return value
+
+
 def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
     """Generate rows for the schema. `max_rows` (if provided) caps row count."""
     requested = int(schema["num_rows"])
@@ -175,10 +183,7 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
             value = generate_value(field["type"], field)
             if field["type"] == "Row Number":
                 value = i + 1
-            blank_pct = field.get("blank_percentage")
-            if blank_pct and random.random() < (blank_pct / 100):
-                value = None
-            row[field["name"]] = value
+            row[field["name"]] = _apply_blank_percentage(value, field)
 
         # Pass 2 — templates can reference any other field.
         for field in fields:
@@ -186,10 +191,7 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
                 continue
             template = field.get("template", "") or ""
             value = render_template_value(template, row)
-            blank_pct = field.get("blank_percentage")
-            if blank_pct and random.random() < (blank_pct / 100):
-                value = None
-            row[field["name"]] = value
+            row[field["name"]] = _apply_blank_percentage(value, field)
 
         data.append(row)
     return data
@@ -197,12 +199,43 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
 
 # ---------- Formatters --------------------------------------------------
 
+def _column_order(data: list[dict]) -> list[str]:
+    """Return field names in schema order, taken from the first row.
+
+    All rows share the same keys (generate_data always emits every field),
+    so the first row's key order is authoritative for every formatter.
+    """
+    return list(data[0].keys())
+
+
+def _stringify_value(value: Any) -> str:
+    """Render a value as export text: None becomes an empty string."""
+    return "" if value is None else str(value)
+
+
+# Leading characters that spreadsheet apps (Excel, Sheets, LibreOffice)
+# interpret as the start of a formula. A string value starting with one of
+# these gets prefixed with a single quote so it's treated as literal text.
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_formula(value: Any) -> Any:
+    """Prefix values that would be interpreted as spreadsheet formulas."""
+    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGER_CHARS):
+        return "'" + value
+    return value
+
+
+def _sanitize_row_for_export(row: dict) -> dict:
+    return {k: _neutralize_formula(v) for k, v in row.items()}
+
+
 def format_csv(data: list[dict]) -> str:
     output = io.StringIO()
     if data:
-        writer = csv.DictWriter(output, fieldnames=list(data[0].keys()))
+        writer = csv.DictWriter(output, fieldnames=_column_order(data))
         writer.writeheader()
-        writer.writerows(data)
+        writer.writerows(_sanitize_row_for_export(row) for row in data)
     return output.getvalue()
 
 
@@ -230,7 +263,7 @@ def format_xml(data: list[dict]) -> str:
         record = ET.SubElement(root, "record")
         for key, value in item.items():
             field = ET.SubElement(record, _sanitize_xml_name(key))
-            field.text = "" if value is None else str(value)
+            field.text = _stringify_value(value)
 
     xml_bytes = ET.tostring(root, encoding="utf-8")
     pretty = xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent="  ")
@@ -260,23 +293,35 @@ def _infer_sql_type(column: str, data: list[dict]) -> str:
     return "TEXT"
 
 
+def _quote_sql_identifier(name: str) -> str:
+    """Quote a SQL identifier (table or column name) for safe interpolation.
+
+    Field names are user-controlled; wrapping in double quotes and doubling
+    any embedded double quotes prevents identifier injection while staying
+    valid across common SQL dialects (SQLite, Postgres, standard SQL).
+    """
+    escaped = str(name).replace('"', '""')
+    return f'"{escaped}"'
+
+
 def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
     if not data:
         return ""
 
-    columns = list(data[0].keys())
+    columns = _column_order(data)
+    quoted_table = _quote_sql_identifier(table_name)
     lines = [
         "-- SQL Data Export",
         f"-- Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"CREATE TABLE IF NOT EXISTS {table_name} (",
+        f"CREATE TABLE IF NOT EXISTS {quoted_table} (",
     ]
-    column_defs = [f"    {col} {_infer_sql_type(col, data)}" for col in columns]
+    column_defs = [f"    {_quote_sql_identifier(col)} {_infer_sql_type(col, data)}" for col in columns]
     lines.append(",\n".join(column_defs))
     lines.append(");")
     lines.append("")
 
-    column_list = ", ".join(columns)
+    column_list = ", ".join(_quote_sql_identifier(col) for col in columns)
     for row in data:
         values = []
         for col in columns:
@@ -290,7 +335,7 @@ def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
             else:
                 escaped = str(value).replace("'", "''")
                 values.append(f"'{escaped}'")
-        lines.append(f"INSERT INTO {table_name} ({column_list}) VALUES ({', '.join(values)});")
+        lines.append(f"INSERT INTO {quoted_table} ({column_list}) VALUES ({', '.join(values)});")
 
     return "\n".join(lines)
 
@@ -303,7 +348,7 @@ def format_excel(data: list[dict]) -> bytes | None:
     ws = wb.active
     ws.title = "Mock Data"
 
-    headers = list(data[0].keys())
+    headers = _column_order(data)
     bold = openpyxl.styles.Font(bold=True)
     max_widths = [len(str(h)) for h in headers]
 
@@ -313,7 +358,7 @@ def format_excel(data: list[dict]) -> bytes | None:
 
     for row_idx, row_data in enumerate(data, 2):
         for col_idx, header in enumerate(headers, 1):
-            value = row_data[header]
+            value = _neutralize_formula(row_data[header])
             ws.cell(row=row_idx, column=col_idx, value=value)
             if value is not None:
                 width = len(str(value))
@@ -454,7 +499,7 @@ _CREATE_TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 _COLUMN_LINE_RE = re.compile(
-    r"^\s*[`\"\[]?(\w+)[`\"\]]?\s+([A-Za-z][A-Za-z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)",
+    r"^\s*[`\"\[]?(\w+)[`\"\]]?\s+([A-Za-z][A-Za-z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)*\))?)",
 )
 
 

@@ -1,10 +1,12 @@
 """Tests for the Mock Data Factory app."""
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +21,7 @@ from app import (  # noqa: E402
     _validate_schema,
     app,
     format_csv,
+    format_excel,
     format_json,
     format_sql,
     format_xml,
@@ -127,6 +130,24 @@ def test_blank_percentage_modifier_produces_nulls():
     assert all(row["name"] is None for row in data)
 
 
+def test_blank_null_type_is_empty_string_when_not_nulled():
+    # Regression: Blank/Null used to fall back to a random fake word when a
+    # row wasn't chosen for blanking, so the column was never truly blank.
+    config = {"blank_percentage": 0}
+    for _ in range(20):
+        assert generate_value("Blank/Null", config) == ""
+
+
+def test_blank_null_type_respects_blank_percentage():
+    schema = {
+        "fields": [{"name": "x", "type": "Blank/Null", "blank_percentage": 100}],
+        "num_rows": 10,
+        "format": "JSON",
+    }
+    data = generate_data(schema)
+    assert all(row["x"] is None for row in data)
+
+
 # ---- formatters -----------------------------------------------------------
 
 def test_format_csv_writes_header_and_rows():
@@ -140,6 +161,27 @@ def test_format_csv_writes_header_and_rows():
 
 def test_format_csv_empty():
     assert format_csv([]) == ""
+
+
+def test_format_csv_neutralizes_formula_injection():
+    # Values that spreadsheet apps would interpret as formulas must be
+    # prefixed with a single quote so they're imported as literal text.
+    data = [{"a": "=1+1", "b": "+cmd", "c": "-x", "d": "@x", "e": "safe", "f": 5}]
+    out = format_csv(data)
+    lines = out.strip().splitlines()
+    assert lines[1] == "'=1+1,'+cmd,'-x,'@x,safe,5"
+
+
+def test_format_excel_neutralizes_formula_injection():
+    data = [{"a": "=1+1", "b": "safe"}]
+    xlsx_bytes = format_excel(data)
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb.active
+    cell_a2 = ws.cell(row=2, column=1)
+    cell_b2 = ws.cell(row=2, column=2)
+    assert cell_a2.value == "'=1+1"
+    assert cell_a2.data_type == "s"  # stored as text, not formula ("f")
+    assert cell_b2.value == "safe"
 
 
 def test_format_json_is_parseable():
@@ -173,10 +215,10 @@ def test_format_sql_uses_correct_column_types():
         {"id": 1, "price": 9.99, "name": "x", "created": "2024-01-01"},
     ]
     out = format_sql(data)
-    assert "id INTEGER" in out
-    assert "price REAL" in out
-    assert "name TEXT" in out
-    assert "created DATE" in out
+    assert '"id" INTEGER' in out
+    assert '"price" REAL' in out
+    assert '"name" TEXT' in out
+    assert '"created" DATE' in out
 
 
 def test_infer_sql_type_skips_leading_nulls():
@@ -188,13 +230,28 @@ def test_infer_sql_type_skips_leading_nulls():
 def test_format_sql_handles_bool_as_integer():
     data = [{"flag": True}, {"flag": False}]
     out = format_sql(data)
-    assert "flag INTEGER" in out
+    assert '"flag" INTEGER' in out
     assert "VALUES (1)" in out
     assert "VALUES (0)" in out
 
 
 def test_format_sql_empty():
     assert format_sql([]) == ""
+
+
+def test_format_sql_quotes_malicious_column_name():
+    # Regression: a field name containing SQL syntax must not break out of
+    # the identifier position in CREATE TABLE / INSERT.
+    data = [{'evil"); DROP TABLE users; --': "x"}]
+    out = format_sql(data)
+    assert '"evil""); DROP TABLE users; --" TEXT' in out
+    assert 'INSERT INTO "mock_data" ("evil""); DROP TABLE users; --")' in out
+
+
+def test_format_sql_quotes_table_name():
+    out = format_sql([{"a": 1}], table_name='t"); DROP TABLE users; --')
+    assert 'CREATE TABLE IF NOT EXISTS "t""); DROP TABLE users; --" (' in out
+    assert 'INSERT INTO "t""); DROP TABLE users; --"' in out
 
 
 # ---- _validate_schema -----------------------------------------------------
@@ -365,6 +422,19 @@ def test_infer_from_sql_extracts_columns():
     assert by_name["balance"]["type"] == "Decimal"
     assert by_name["active"]["type"] == "Custom List"
     assert by_name["active"]["values"] == ["true", "false"]
+
+
+def test_infer_from_sql_handles_multi_param_numeric_type():
+    # Regression: _COLUMN_LINE_RE used to allow at most two numeric params,
+    # so a type like NUMERIC(18,4,2) would fail to match the column line.
+    sql = """
+    CREATE TABLE t (
+        id INT,
+        amount NUMERIC(18,4,2)
+    );
+    """
+    fields = infer_from_sql(sql)
+    assert [f["name"] for f in fields] == ["id", "amount"]
 
 
 def test_infer_from_sql_skips_constraints():
