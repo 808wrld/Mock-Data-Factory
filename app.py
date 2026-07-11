@@ -199,12 +199,29 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
 
 # ---------- Formatters --------------------------------------------------
 
+# Leading characters that spreadsheet apps (Excel, Sheets, LibreOffice)
+# interpret as the start of a formula. A string value starting with one of
+# these gets prefixed with a single quote so it's treated as literal text.
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_formula(value: Any) -> Any:
+    """Prefix values that would be interpreted as spreadsheet formulas."""
+    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGER_CHARS):
+        return "'" + value
+    return value
+
+
+def _sanitize_row_for_export(row: dict) -> dict:
+    return {k: _neutralize_formula(v) for k, v in row.items()}
+
+
 def format_csv(data: list[dict]) -> str:
     output = io.StringIO()
     if data:
         writer = csv.DictWriter(output, fieldnames=list(data[0].keys()))
         writer.writeheader()
-        writer.writerows(data)
+        writer.writerows(_sanitize_row_for_export(row) for row in data)
     return output.getvalue()
 
 
@@ -327,7 +344,7 @@ def format_excel(data: list[dict]) -> bytes | None:
 
     for row_idx, row_data in enumerate(data, 2):
         for col_idx, header in enumerate(headers, 1):
-            value = row_data[header]
+            value = _neutralize_formula(row_data[header])
             ws.cell(row=row_idx, column=col_idx, value=value)
             if value is not None:
                 width = len(str(value))
