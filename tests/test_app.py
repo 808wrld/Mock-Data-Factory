@@ -12,14 +12,18 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import (  # noqa: E402
+    MAX_CELLS,
     MAX_CONTENT_LENGTH,
     MAX_FIELDS,
     MAX_ROWS,
+    MAX_TEMPLATE_LENGTH,
     SchemaError,
     _infer_sql_type,
+    _name_to_type,
     _sanitize_xml_name,
     _validate_schema,
     app,
+    compile_template,
     format_csv,
     format_excel,
     format_json,
@@ -173,15 +177,18 @@ def test_format_csv_neutralizes_formula_injection():
 
 
 def test_format_excel_neutralizes_formula_injection():
-    data = [{"a": "=1+1", "b": "safe"}]
+    data = [{"a": "=1+1", "b": "safe", "c": "+1-202-555-0100", "d": "#N/A", "e": 7}]
     xlsx_bytes = format_excel(data)
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
     ws = wb.active
     cell_a2 = ws.cell(row=2, column=1)
-    cell_b2 = ws.cell(row=2, column=2)
-    assert cell_a2.value == "'=1+1"
-    assert cell_a2.data_type == "s"  # stored as text, not formula ("f")
-    assert cell_b2.value == "safe"
+    # Stored as text, not as a formula ("f"), and without a visible quote prefix.
+    assert cell_a2.value == "=1+1"
+    assert cell_a2.data_type == "s"
+    assert ws.cell(row=2, column=2).value == "safe"
+    assert ws.cell(row=2, column=3).value == "+1-202-555-0100"
+    assert ws.cell(row=2, column=4).data_type == "s"
+    assert ws.cell(row=2, column=5).value == 7
 
 
 def test_format_json_is_parseable():
@@ -670,3 +677,130 @@ def test_endpoint_returns_413_for_oversize_request(client):
         content_type="application/json",
     )
     assert response.status_code == 413
+
+
+# ---- Review follow-ups ------------------------------------------------------
+
+def _schema(fields, num_rows=1, fmt="CSV", **extra):
+    return {"fields": fields, "num_rows": num_rows, "format": fmt, **extra}
+
+
+def test_format_csv_can_skip_formula_escaping():
+    data = [{"phone": "+1-202-555-0100", "f": "=1+1"}]
+    lines = format_csv(data, escape_formulas=False).strip().splitlines()
+    assert lines[1] == "+1-202-555-0100,=1+1"
+
+
+def test_generate_endpoint_honours_csv_formula_escape_flag(client):
+    fields = [{"name": "v", "type": "Custom List", "values": ["+1-202-555-0100"]}]
+    raw = client.post("/generate", json=_schema(fields, csv_formula_escape=False))
+    escaped = client.post("/generate", json=_schema(fields))
+    assert raw.get_data(as_text=True).splitlines()[1] == "+1-202-555-0100"
+    assert escaped.get_data(as_text=True).splitlines()[1] == "'+1-202-555-0100"
+
+
+def test_validate_schema_rejects_non_bool_csv_formula_escape():
+    with pytest.raises(SchemaError):
+        _validate_schema(_schema([{"name": "a", "type": "City"}], csv_formula_escape="no"))
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{a|" + " " * 996,       # unclosed filter chain followed by whitespace
+        "{{" * 500,               # flood of opening braces
+        "{{" + "a" * 998,         # unclosed field name
+        "{{a| x" * 166,
+    ],
+)
+def test_template_parsing_is_fast_on_pathological_input(template):
+    # Regression: the old token pattern backtracked catastrophically —
+    # a ~2 KB unclosed token took ~26 s to render, once per generated row.
+    import time
+
+    start = time.perf_counter()
+    compile_template(template)
+    assert time.perf_counter() - start < 0.5
+
+
+def test_template_keeps_literal_braces_around_tokens():
+    assert render_template_value("{{{a}}}", {"a": "X"}) == "{X}"
+
+
+def test_template_with_empty_filter_chain_renders_value():
+    assert render_template_value("{{a|}}", {"a": "X"}) == "X"
+
+
+def test_template_ignores_unknown_filters_and_whitespace():
+    assert render_template_value("{{ a | upper | nope }}", {"a": "x"}) == "X"
+
+
+def test_validate_schema_rejects_overlong_template():
+    field = {"name": "t", "type": "Template", "template": "x" * (MAX_TEMPLATE_LENGTH + 1)}
+    with pytest.raises(SchemaError):
+        _validate_schema(_schema([field]))
+
+
+def test_validate_schema_normalizes_numeric_string_blank_percentage():
+    # Regression: "50" passed validation but the generator then divided a
+    # string by 100 and returned a 500.
+    schema = _validate_schema(_schema([{"name": "a", "type": "City", "blank_percentage": "50"}]))
+    assert schema["fields"][0]["blank_percentage"] == 50
+    generate_data(schema)  # must not raise
+
+
+def test_validate_schema_rejects_unknown_type():
+    with pytest.raises(SchemaError, match="unknown type"):
+        _validate_schema(_schema([{"name": "a", "type": "Not A Type"}]))
+
+
+def test_validate_schema_rejects_duplicate_names():
+    with pytest.raises(SchemaError, match="Duplicate"):
+        _validate_schema(_schema([{"name": "a", "type": "City"}, {"name": "a", "type": "Country"}]))
+
+
+def test_validate_schema_rejects_non_scalar_custom_list_values():
+    field = {"name": "a", "type": "Custom List", "values": [{"nested": 1}]}
+    with pytest.raises(SchemaError):
+        _validate_schema(_schema([field]))
+
+
+def test_validate_schema_rejects_too_many_cells():
+    fields = [{"name": f"c{i}", "type": "City"} for i in range(20)]
+    rows = MAX_CELLS // 20 + 1
+    if rows > MAX_ROWS:
+        pytest.skip("MAX_ROWS is below the cell cap for this field count")
+    with pytest.raises(SchemaError, match="cells"):
+        _validate_schema(_schema(fields, num_rows=rows))
+
+
+def test_format_sql_states_target_dialect():
+    assert "-- Dialect: SQLite / PostgreSQL" in format_sql([{"a": 1}])
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("paid", "(fallback)"),
+        ("is_valid", "(fallback)"),
+        ("uuid", "(fallback)"),
+        ("message", "(fallback)"),
+        ("language", "(fallback)"),
+        ("hotel_name", "(fallback)"),
+        ("capacity", "(fallback)"),
+        ("destination", "(fallback)"),
+        ("account_name", "(fallback)"),
+        ("cancelled_at", "Date"),
+        ("publishedAt", "Date"),
+        ("discount", "Decimal"),
+        ("view_count", "Number"),
+        ("userId", "Row Number"),
+        ("IPAddress", "IP Address v4"),
+        ("e_mail", "Email Address"),
+        ("phone_number", "Phone Number"),
+        ("lastName", "Last Name"),
+        ("display_name", "Full Name"),
+    ],
+)
+def test_name_heuristics_match_whole_words(name, expected):
+    assert _name_to_type(name, "(fallback)") == expected
