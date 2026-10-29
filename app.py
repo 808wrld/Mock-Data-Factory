@@ -822,7 +822,7 @@ def request_too_large(_e):
 
 @app.route("/")
 def index():
-    return render_template("index.html", default_schema=DEFAULT_SCHEMA)
+    return render_template("index.html", default_schema=DEFAULT_SCHEMA, max_rows=MAX_ROWS)
 
 
 @app.route("/preview", methods=["POST"])

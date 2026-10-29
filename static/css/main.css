@@ -23,7 +23,7 @@
     --rule-strong: #D9CCB6;
 
     /* Colors */
-    --primary: #C8552F;
+    --primary: #BC4E2A;  /* 4.7:1 with --primary-ink, passes WCAG AA for button text */
     --primary-ink: #FFF8F0;
     --primary-hover: #A8431F;
     --primary-soft: #F4D7C7;
@@ -425,7 +425,27 @@ a:hover {
     box-shadow: var(--shadow-xs);
 }
 
+/* Drag handle and remove button are real <button>s (keyboard + screen
+   reader accessible); strip the default button chrome. */
+.drag-handle,
+.remove-btn {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font: inherit;
+}
+
+.drag-handle:focus-visible,
+.remove-btn:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    color: var(--primary);
+    opacity: 1;
+}
+
 .drag-handle {
+    border-radius: var(--r-xs);
     cursor: grab;
     color: var(--ink-faint);
     display: flex;
@@ -703,6 +723,32 @@ body.theme-dark .btn-add-field:hover {
 .control-group input,
 .control-group select {
     width: 140px;
+}
+
+.csv-options {
+    max-width: 230px;
+}
+
+.control-group .csv-escape-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s-2);
+    cursor: pointer;
+    color: var(--ink-2);
+}
+
+.control-group .csv-escape-toggle input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: var(--primary);
+    cursor: pointer;
+}
+
+.csv-escape-hint {
+    font-size: 0.72rem;
+    line-height: 1.4;
+    color: var(--ink-soft);
 }
 
 .control-group.ms-auto {

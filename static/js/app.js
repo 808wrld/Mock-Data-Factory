@@ -9,7 +9,7 @@ const I18N = {
 
         "header.eyebrow": "A small machine for synthetic data",
         "header.tagline": "Sketch a schema. Pour out as many rows as you need — in CSV, JSON, XML, SQL, or Excel.",
-        "header.meta.types": "15 types",
+        "header.meta.types": "16 types",
         "header.meta.formats": "5 formats",
         "header.meta.telemetry": "0 telemetry",
 
@@ -17,7 +17,7 @@ const I18N = {
         "schema.field_name": "Field name",
         "schema.type": "Type",
         "schema.field_placeholder": "field_name",
-        "schema.values_placeholder": "value1, value2, value3",
+        "schema.values_placeholder": 'value1, value2, "value, with comma"',
         "schema.blank_placeholder": "Blank %",
         "schema.null_label": "null",
 
@@ -37,11 +37,13 @@ const I18N = {
         "btn.cancel": "Cancel",
         "btn.parse": "Parse & replace",
         "btn.toggle_theme": "Toggle theme",
-        "btn.drag_handle": "Drag to reorder",
+        "btn.drag_handle": "Drag to reorder (or focus and press ↑ / ↓)",
         "btn.remove_field": "Remove field",
 
         "output.rows": "Rows",
         "output.format": "Format",
+        "output.csv_escape": "Excel-safe",
+        "output.csv_escape_hint": "Prefix values starting with = + - @ so spreadsheets don't run them as formulas",
 
         "modal.preview.title": "Preview",
         "modal.infer.title": "Infer schema",
@@ -91,7 +93,7 @@ const I18N = {
 
         "header.eyebrow": "一个用来生成假数据的小工具",
         "header.tagline": "勾画 Schema，按需倒出任意行数 —— 支持 CSV、JSON、XML、SQL、Excel。",
-        "header.meta.types": "15 种字段类型",
+        "header.meta.types": "16 种字段类型",
         "header.meta.formats": "5 种导出格式",
         "header.meta.telemetry": "0 数据采集",
 
@@ -99,7 +101,7 @@ const I18N = {
         "schema.field_name": "字段名",
         "schema.type": "类型",
         "schema.field_placeholder": "field_name",
-        "schema.values_placeholder": "值1, 值2, 值3",
+        "schema.values_placeholder": '值1, 值2, "带, 逗号的值"',
         "schema.blank_placeholder": "空值 %",
         "schema.null_label": "空值",
 
@@ -119,11 +121,13 @@ const I18N = {
         "btn.cancel": "取消",
         "btn.parse": "解析并替换",
         "btn.toggle_theme": "切换主题",
-        "btn.drag_handle": "拖动重排",
+        "btn.drag_handle": "拖动重排（或聚焦后按 ↑ / ↓）",
         "btn.remove_field": "删除字段",
 
         "output.rows": "行数",
         "output.format": "格式",
+        "output.csv_escape": "Excel 安全",
+        "output.csv_escape_hint": "以 = + - @ 开头的值加前缀，防止表格软件当作公式执行",
 
         "modal.preview.title": "预览",
         "modal.infer.title": "反推 Schema",
@@ -222,6 +226,9 @@ function setLanguage(lang) {
     document.querySelectorAll("[data-i18n-title]").forEach(el => {
         el.title = t(el.dataset.i18nTitle);
     });
+    document.querySelectorAll("[data-i18n-aria-label]").forEach(el => {
+        el.setAttribute("aria-label", t(el.dataset.i18nAriaLabel));
+    });
 
     // Re-label type dropdowns: option value stays English, label is translated.
     const labels = TYPE_LABELS[lang] || TYPE_LABELS.en;
@@ -304,10 +311,13 @@ function buildFieldRow(fieldId, initial = {}) {
     const initialName = initial.name ?? suggestFieldName(initialType);
     const labels = TYPE_LABELS[currentLang] || TYPE_LABELS.en;
 
-    const dragHandle = document.createElement("div");
+    const dragHandle = document.createElement("button");
+    dragHandle.type = "button";
     dragHandle.className = "drag-handle";
     dragHandle.title = t("btn.drag_handle");
+    dragHandle.setAttribute("aria-label", t("btn.drag_handle"));
     dragHandle.setAttribute("data-i18n-title", "btn.drag_handle");
+    dragHandle.setAttribute("data-i18n-aria-label", "btn.drag_handle");
     fieldRow.appendChild(dragHandle);
 
     const nameWrap = document.createElement("div");
@@ -349,7 +359,7 @@ function buildFieldRow(fieldId, initial = {}) {
     customListInput.placeholder = t("schema.values_placeholder");
     customListInput.setAttribute("data-i18n-placeholder", "schema.values_placeholder");
     if (initial.values && Array.isArray(initial.values)) {
-        customListInput.value = initial.values.join(", ");
+        customListInput.value = formatListValues(initial.values);
     }
     inputStack.appendChild(customListInput);
 
@@ -408,13 +418,17 @@ function buildFieldRow(fieldId, initial = {}) {
     inputStack.appendChild(blankModifier);
     fieldRow.appendChild(inputStack);
 
-    const removeBtn = document.createElement("div");
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
     removeBtn.className = "remove-btn";
     removeBtn.dataset.fieldId = fieldId;
     removeBtn.title = t("btn.remove_field");
+    removeBtn.setAttribute("aria-label", t("btn.remove_field"));
     removeBtn.setAttribute("data-i18n-title", "btn.remove_field");
+    removeBtn.setAttribute("data-i18n-aria-label", "btn.remove_field");
     const removeIcon = document.createElement("i");
     removeIcon.className = "bi bi-x-lg";
+    removeIcon.setAttribute("aria-hidden", "true");
     removeBtn.appendChild(removeIcon);
     fieldRow.appendChild(removeBtn);
 
@@ -457,6 +471,57 @@ function handleDataTypeChange(select) {
     }
 }
 
+// Custom List values are comma-separated; wrap a value in double quotes to
+// keep commas inside it ("a, b" stays one value) and write "" for a literal
+// quote — the same rules as a CSV line.
+function parseListValues(text) {
+    const values = [];
+    let current = "";
+    let quoted = false;     // currently inside "..."
+    let wasQuoted = false;  // this value started with a quote
+    let quotedEnd = 0;      // length of `current` when the closing quote was seen
+    const flush = () => {
+        const value = wasQuoted
+            ? current.slice(0, quotedEnd) + current.slice(quotedEnd).trim()
+            : current.trim();
+        if (value !== "") values.push(value);
+        current = "";
+        wasQuoted = false;
+        quotedEnd = 0;
+    };
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (quoted) {
+            if (ch === '"' && text[i + 1] === '"') {
+                current += '"';
+                i++;
+            } else if (ch === '"') {
+                quoted = false;
+                quotedEnd = current.length;
+            } else {
+                current += ch;
+            }
+        } else if (ch === '"' && !wasQuoted && current.trim() === "") {
+            quoted = true;
+            wasQuoted = true;
+            current = "";
+        } else if (ch === ",") {
+            flush();
+        } else {
+            current += ch;
+        }
+    }
+    flush();
+    return values;
+}
+
+function formatListValues(values) {
+    return values.map(value => {
+        const v = String(value);
+        return /[",]/.test(v) || v !== v.trim() ? `"${v.replace(/"/g, '""')}"` : v;
+    }).join(", ");
+}
+
 function collectSchema(numRowsOverride) {
     const numRowsInput = document.getElementById("numRows");
     const schema = {
@@ -484,8 +549,7 @@ function collectSchema(numRowsOverride) {
         const field = { name: fieldName, type: typeSelect.value };
 
         if (field.type === "Custom List") {
-            const values = row.querySelector(".custom-list-input").value
-                .split(",").map(v => v.trim()).filter(Boolean);
+            const values = parseListValues(row.querySelector(".custom-list-input").value);
             if (values.length === 0) {
                 throw new Error(t("error.custom_list_empty", { name: fieldName }));
             }
@@ -522,6 +586,9 @@ function collectSchema(numRowsOverride) {
         schema.fields.push(field);
     });
 
+    if (schema.format.toUpperCase() === "CSV") {
+        schema.csv_formula_escape = document.getElementById("csvFormulaEscape").checked;
+    }
     return schema;
 }
 
@@ -538,6 +605,40 @@ function getCurrentFields() {
     }
 }
 
+function getOutputSettings() {
+    return {
+        num_rows: parseInt(document.getElementById("numRows").value, 10) || 100,
+        format: document.getElementById("outputFormat").value,
+        csv_formula_escape: document.getElementById("csvFormulaEscape").checked,
+    };
+}
+
+function applyOutputSettings(settings) {
+    if (!settings) {
+        updateFormatOptions();
+        return;
+    }
+    const numRows = document.getElementById("numRows");
+    const format = document.getElementById("outputFormat");
+    if (Number.isInteger(settings.num_rows) && settings.num_rows > 0) {
+        numRows.value = settings.num_rows;
+    }
+    if (typeof settings.format === "string" &&
+        Array.from(format.options).some(o => o.value === settings.format)) {
+        format.value = settings.format;
+    }
+    if (typeof settings.csv_formula_escape === "boolean") {
+        document.getElementById("csvFormulaEscape").checked = settings.csv_formula_escape;
+    }
+    updateFormatOptions();
+}
+
+// The Excel-safe toggle only applies to CSV exports.
+function updateFormatOptions() {
+    const csvOptions = document.getElementById("csvOptions");
+    if (csvOptions) csvOptions.hidden = document.getElementById("outputFormat").value !== "CSV";
+}
+
 let persistTimer = null;
 function persistSchema() {
     if (restoring) return;
@@ -545,11 +646,23 @@ function persistSchema() {
     persistTimer = setTimeout(() => {
         try {
             const fields = getCurrentFields();
-            localStorage.setItem(STORAGE_KEY, JSON.stringify({ fields }));
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({ fields, ...getOutputSettings() }));
         } catch (err) {
             console.warn("Failed to persist schema:", err);
         }
     }, 250);
+}
+
+// Revoking an object URL in the same tick as a.click() can cancel the
+// download in Safari and Firefox, so give the browser time to start it.
+function triggerDownload(url, filename) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 function restoreSchema(fields) {
@@ -587,14 +700,7 @@ function copyShareUrl() {
 function exportSchema() {
     const fields = getCurrentFields();
     const blob = new Blob([JSON.stringify({ fields }, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `schema_${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    URL.revokeObjectURL(url);
-    a.remove();
+    triggerDownload(URL.createObjectURL(blob), `schema_${new Date().toISOString().slice(0, 10)}.json`);
     showToast(t("toast.exported"), "success");
 }
 
@@ -817,15 +923,11 @@ async function generateData(fromPreview = false) {
         try {
             const response = await postJson("/generate", schema);
             const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
             const ext = FORMAT_EXTENSIONS[schema.format.toUpperCase()] || schema.format.toLowerCase();
-            a.href = url;
-            a.download = `mock_data_${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
-            document.body.appendChild(a);
-            a.click();
-            URL.revokeObjectURL(url);
-            a.remove();
+            triggerDownload(
+                URL.createObjectURL(blob),
+                `mock_data_${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`,
+            );
 
             if (fromPreview) {
                 bootstrap.Modal.getInstance(previewModalElement)?.hide();
@@ -873,6 +975,13 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     // ---- Restore: URL hash > localStorage > default ----
+    let storedState = null;
+    try {
+        storedState = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+    } catch (err) {
+        console.warn("Bad stored schema:", err);
+    }
+    applyOutputSettings(storedState);
     let restored = false;
     const hashMatch = location.hash.match(/[#&]s=([^&]+)/);
     if (hashMatch) {
@@ -887,16 +996,10 @@ document.addEventListener("DOMContentLoaded", () => {
             console.warn("Bad hash schema:", err);
         }
     }
-    if (!restored) {
+    if (!restored && storedState && Array.isArray(storedState.fields) && storedState.fields.length) {
         try {
-            const stored = localStorage.getItem(STORAGE_KEY);
-            if (stored) {
-                const parsed = JSON.parse(stored);
-                if (parsed.fields && parsed.fields.length) {
-                    restoreSchema(parsed.fields);
-                    restored = true;
-                }
-            }
+            restoreSchema(storedState.fields);
+            restored = true;
         } catch (err) {
             console.warn("Bad stored schema:", err);
         }
@@ -947,6 +1050,31 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
+    ["numRows", "outputFormat", "csvFormulaEscape"].forEach(id => {
+        document.getElementById(id)?.addEventListener("change", () => {
+            updateFormatOptions();
+            persistSchema();
+        });
+    });
+
+    // Keyboard reordering: focus a row's drag handle and press ArrowUp / ArrowDown.
+    fieldList.addEventListener("keydown", event => {
+        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+        const handle = event.target.closest(".drag-handle");
+        if (!handle) return;
+        event.preventDefault();
+        const row = handle.closest(".field-row");
+        if (event.key === "ArrowUp" && row.previousElementSibling) {
+            fieldList.insertBefore(row, row.previousElementSibling);
+        } else if (event.key === "ArrowDown" && row.nextElementSibling) {
+            fieldList.insertBefore(row.nextElementSibling, row);
+        } else {
+            return;
+        }
+        handle.focus();
+        persistSchema();
+    });
+
     // Field interactions
     fieldList.addEventListener("change", event => {
         if (event.target.classList.contains("data-type")) {
@@ -992,9 +1120,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const isDark = document.body.classList.contains("theme-dark");
         const next = isDark ? "light" : "dark";
         applyTheme(next);
-        localStorage.setItem("selectedTheme", next);
+        try { localStorage.setItem("selectedTheme", next); } catch (_) { /* ignore */ }
     });
 
-    const saved = localStorage.getItem("selectedTheme");
+    let saved = null;
+    try { saved = localStorage.getItem("selectedTheme"); } catch (_) { /* ignore */ }
     if (saved) applyTheme(saved);
 });
