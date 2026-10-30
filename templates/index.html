@@ -88,9 +88,9 @@
                 {% if default_schema %}
                 {% for field in default_schema %}
                 <div class="field-row" data-field-id="field-init-{{ loop.index }}">
-                    <button type="button" class="drag-handle" title="Drag to reorder"
+                    <div class="drag-handle" role="button" tabindex="0" title="Drag to reorder"
                         aria-label="Drag to reorder" data-i18n-title="btn.drag_handle"
-                        data-i18n-aria-label="btn.drag_handle"></button>
+                        data-i18n-aria-label="btn.drag_handle"></div>
                     <div>
                         <input type="text" class="form-control form-control-sm field-name"
                             id="field-init-{{ loop.index }}-name"

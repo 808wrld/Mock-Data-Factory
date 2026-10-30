@@ -425,8 +425,9 @@ a:hover {
     box-shadow: var(--shadow-xs);
 }
 
-/* Drag handle and remove button are real <button>s (keyboard + screen
-   reader accessible); strip the default button chrome. */
+/* The remove button is a real <button> and the drag handle a focusable
+   role="button" div (keyboard + screen reader accessible); strip the
+   default button chrome. */
 .drag-handle,
 .remove-btn {
     appearance: none;

@@ -800,6 +800,12 @@ def test_format_sql_states_target_dialect():
         ("phone_number", "Phone Number"),
         ("lastName", "Last Name"),
         ("display_name", "Full Name"),
+        ("years_experience", "Number"),
+        ("unit_prices", "Decimal"),
+        ("emails", "Email Address"),
+        ("cities", "City"),
+        ("address", "(fallback)"),
+        ("status", "(fallback)"),
     ],
 )
 def test_name_heuristics_match_whole_words(name, expected):

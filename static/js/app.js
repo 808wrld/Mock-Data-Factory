@@ -311,9 +311,12 @@ function buildFieldRow(fieldId, initial = {}) {
     const initialName = initial.name ?? suggestFieldName(initialType);
     const labels = TYPE_LABELS[currentLang] || TYPE_LABELS.en;
 
-    const dragHandle = document.createElement("button");
-    dragHandle.type = "button";
+    // A focusable div rather than a <button>: Firefox never starts a native
+    // drag from a <button>, which would break Sortable's mouse dragging.
+    const dragHandle = document.createElement("div");
     dragHandle.className = "drag-handle";
+    dragHandle.setAttribute("role", "button");
+    dragHandle.tabIndex = 0;
     dragHandle.title = t("btn.drag_handle");
     dragHandle.setAttribute("aria-label", t("btn.drag_handle"));
     dragHandle.setAttribute("data-i18n-title", "btn.drag_handle");

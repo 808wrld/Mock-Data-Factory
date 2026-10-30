@@ -520,14 +520,24 @@ def _validate_schema(schema: Any) -> dict:
 
 # ---------- Schema inference --------------------------------------------
 
-def _name_tokens(name: str) -> list[str]:
-    """Split snake_case, kebab-case and camelCase names into lower-case words.
+def _singular(word: str) -> str:
+    """Crude singular form so plural column names still match: "years" -> "year"."""
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
 
-    "createdAt" -> ["created", "at"], "IPAddress" -> ["ip", "address"].
+
+def _name_tokens(name: str) -> list[str]:
+    """Split snake_case, kebab-case and camelCase names into singular lower-case words.
+
+    "createdAt" -> ["created", "at"], "IPAddress" -> ["ip", "address"],
+    "years_active" -> ["year", "active"].
     """
     spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", spaced)
-    return [t.lower() for t in re.split(r"[^A-Za-z0-9]+", spaced) if t]
+    return [_singular(t.lower()) for t in re.split(r"[^A-Za-z0-9]+", spaced) if t]
 
 
 def _has_phrase(tokens: list[str], *phrase: str) -> bool:
