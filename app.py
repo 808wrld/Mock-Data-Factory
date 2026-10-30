@@ -31,9 +31,13 @@ logger = logging.getLogger(__name__)
 
 # Hard cap to protect against memory exhaustion / DoS.
 MAX_ROWS = int(os.getenv("MOCK_DATA_MAX_ROWS", "100000"))
+# Rows × fields: MAX_ROWS alone still allows 100k rows × 200 fields = 20M cells,
+# which an in-memory Excel export can't handle on a small server.
+MAX_CELLS = int(os.getenv("MOCK_DATA_MAX_CELLS", "2000000"))
 MAX_PREVIEW_ROWS = 100
 MAX_INFER_SOURCE = 32_000  # ~32KB of source text for inference
 MAX_FIELDS = 200            # cap field count per schema
+MAX_TEMPLATE_LENGTH = 1_000  # characters per Template field
 MAX_CONTENT_LENGTH = 256 * 1024  # 256KB request body cap
 
 # Reject oversized request bodies before Flask hands them to a route.
@@ -99,7 +103,11 @@ def generate_value(field_type: str, field_config: dict | None = None) -> Any:
 
 # ---------- Template engine ---------------------------------------------
 
-_TEMPLATE_TOKEN = re.compile(r"\{\{\s*([^}|\s]+)\s*(?:\|\s*([^}]+?)\s*)?\}\}")
+# The field name and the filter chain are matched by character classes that
+# can't overlap with their neighbours, so an unclosed token such as "{{x|   …"
+# fails in linear time instead of backtracking catastrophically. Whitespace
+# around filter names is trimmed in Python rather than in the pattern.
+_TEMPLATE_TOKEN = re.compile(r"\{\{\s*([^{}|\s]+)\s*(?:\|([^}]*))?\}\}")
 
 
 def _filter_slug(value: str) -> str:
@@ -127,6 +135,45 @@ TEMPLATE_FILTERS: dict[str, Callable[[Any], Any]] = {
 }
 
 
+def compile_template(template: str) -> list[str | tuple[str, tuple[Callable[[Any], Any], ...]]]:
+    """Parse a template once into literal strings and `(field, filters)` tokens.
+
+    Unknown filters are dropped here, so rendering a row is a plain loop with
+    no regex work — templates are parsed once per request, not once per row.
+    """
+    parts: list[str | tuple[str, tuple[Callable[[Any], Any], ...]]] = []
+    pos = 0
+    for match in _TEMPLATE_TOKEN.finditer(template or ""):
+        if match.start() > pos:
+            parts.append(template[pos:match.start()])
+        filter_names = (f.strip() for f in (match.group(2) or "").split("|"))
+        filters = tuple(TEMPLATE_FILTERS[f] for f in filter_names if f in TEMPLATE_FILTERS)
+        parts.append((match.group(1), filters))
+        pos = match.end()
+    if template and pos < len(template):
+        parts.append(template[pos:])
+    return parts
+
+
+def render_compiled_template(
+    parts: list[str | tuple[str, tuple[Callable[[Any], Any], ...]]], row: dict[str, Any]
+) -> str:
+    """Render the output of `compile_template` against one row."""
+    out: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            out.append(part)
+            continue
+        name, filters = part
+        value = row.get(name, "")
+        if value is None:
+            value = ""
+        for fn in filters:
+            value = fn(value)
+        out.append(str(value))
+    return "".join(out)
+
+
 def render_template_value(template: str, row: dict[str, Any]) -> str:
     """Replace `{{field|filter}}` tokens in `template` using values from `row`.
 
@@ -134,21 +181,7 @@ def render_template_value(template: str, row: dict[str, Any]) -> str:
     """
     if not template:
         return ""
-
-    def replace(match: re.Match) -> str:
-        name = match.group(1)
-        filter_chain = match.group(2)
-        value = row.get(name, "")
-        if value is None:
-            value = ""
-        if filter_chain:
-            for fname in (f.strip() for f in filter_chain.split("|")):
-                fn = TEMPLATE_FILTERS.get(fname)
-                if fn:
-                    value = fn(value)
-        return str(value)
-
-    return _TEMPLATE_TOKEN.sub(replace, template)
+    return render_compiled_template(compile_template(template), row)
 
 
 # ---------- Core generation ---------------------------------------------
@@ -171,6 +204,11 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
     num_rows = min(num_rows, MAX_ROWS)
 
     fields = schema["fields"]
+    template_fields = [
+        (field, compile_template(field.get("template", "") or ""))
+        for field in fields
+        if field["type"] == "Template"
+    ]
     data: list[dict] = []
 
     for i in range(num_rows):
@@ -186,11 +224,8 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
             row[field["name"]] = _apply_blank_percentage(value, field)
 
         # Pass 2 — templates can reference any other field.
-        for field in fields:
-            if field["type"] != "Template":
-                continue
-            template = field.get("template", "") or ""
-            value = render_template_value(template, row)
+        for field, compiled in template_fields:
+            value = render_compiled_template(compiled, row)
             row[field["name"]] = _apply_blank_percentage(value, field)
 
         data.append(row)
@@ -230,12 +265,22 @@ def _sanitize_row_for_export(row: dict) -> dict:
     return {k: _neutralize_formula(v) for k, v in row.items()}
 
 
-def format_csv(data: list[dict]) -> str:
+def format_csv(data: list[dict], escape_formulas: bool = True) -> str:
+    """Format rows as CSV.
+
+    `escape_formulas` (default on) prefixes values that a spreadsheet would
+    run as a formula with a single quote. Turn it off when the CSV is meant
+    for code rather than Excel/Sheets, so values like "+1-202-555-0100" come
+    through unchanged.
+    """
     output = io.StringIO()
     if data:
         writer = csv.DictWriter(output, fieldnames=_column_order(data))
         writer.writeheader()
-        writer.writerows(_sanitize_row_for_export(row) for row in data)
+        if escape_formulas:
+            writer.writerows(_sanitize_row_for_export(row) for row in data)
+        else:
+            writer.writerows(data)
     return output.getvalue()
 
 
@@ -312,6 +357,8 @@ def format_sql(data: list[dict], table_name: str = "mock_data") -> str:
     quoted_table = _quote_sql_identifier(table_name)
     lines = [
         "-- SQL Data Export",
+        "-- Dialect: SQLite / PostgreSQL (double-quoted identifiers, standard string escaping).",
+        "-- For MySQL, enable ANSI_QUOTES and NO_BACKSLASH_ESCAPES before importing.",
         f"-- Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         f"CREATE TABLE IF NOT EXISTS {quoted_table} (",
@@ -358,8 +405,13 @@ def format_excel(data: list[dict]) -> bytes | None:
 
     for row_idx, row_data in enumerate(data, 2):
         for col_idx, header in enumerate(headers, 1):
-            value = _neutralize_formula(row_data[header])
-            ws.cell(row=row_idx, column=col_idx, value=value)
+            value = row_data[header]
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            if isinstance(value, str):
+                # openpyxl turns strings starting with "=" into formulas (and
+                # "#N/A"-style strings into errors). Force plain text instead of
+                # prefixing a quote, which would show up as part of the value.
+                cell.data_type = "s"
             if value is not None:
                 width = len(str(value))
                 if width > max_widths[col_idx - 1]:
@@ -401,23 +453,35 @@ def _validate_schema(schema: Any) -> dict:
 
     # Per-field shape check — keeps malformed input from reaching the
     # generator (and turning into a 500).
+    seen_names: set[str] = set()
     for idx, field in enumerate(schema["fields"], 1):
         if not isinstance(field, dict):
             raise SchemaError(f"Field #{idx} must be an object")
         name = field.get("name")
         if not isinstance(name, str) or not name.strip():
             raise SchemaError(f"Field #{idx} requires a non-empty name")
+        if name in seen_names:
+            raise SchemaError(f'Duplicate field name "{name}"')
+        seen_names.add(name)
         ftype = field.get("type")
         if not isinstance(ftype, str) or not ftype:
             raise SchemaError(f'Field "{name}" requires a "type" string')
+        if ftype not in GENERATORS:
+            raise SchemaError(f'Field "{name}" has an unknown type "{ftype}"')
         if ftype == "Custom List":
             values = field.get("values")
             if not isinstance(values, list) or not values:
                 raise SchemaError(f'Custom List field "{name}" needs a non-empty "values" list')
+            if not all(isinstance(v, (str, int, float, bool)) for v in values):
+                raise SchemaError(f'Custom List field "{name}" values must be strings or numbers')
         if ftype == "Template":
             template = field.get("template")
             if not isinstance(template, str) or not template.strip():
                 raise SchemaError(f'Template field "{name}" needs a "template" string')
+            if len(template) > MAX_TEMPLATE_LENGTH:
+                raise SchemaError(
+                    f'Template field "{name}" must be at most {MAX_TEMPLATE_LENGTH} characters'
+                )
         pct = field.get("blank_percentage")
         if pct is not None:
             try:
@@ -426,6 +490,13 @@ def _validate_schema(schema: Any) -> dict:
                 raise SchemaError(f'blank_percentage on "{name}" must be an integer') from exc
             if not 0 <= pct_int <= 100:
                 raise SchemaError(f'blank_percentage on "{name}" must be between 0 and 100')
+            # Store the normalized number: the generator divides by it, so a
+            # numeric string like "50" used to pass validation and then 500.
+            field["blank_percentage"] = pct_int
+
+    escape_formulas = schema.get("csv_formula_escape", True)
+    if not isinstance(escape_formulas, bool):
+        raise SchemaError("csv_formula_escape must be true or false")
 
     fmt = str(schema["format"]).upper()
     if fmt not in SUPPORTED_FORMATS:
@@ -438,33 +509,118 @@ def _validate_schema(schema: Any) -> dict:
         raise SchemaError("num_rows must be at least 1")
     if rows > MAX_ROWS:
         raise SchemaError(f"num_rows must not exceed {MAX_ROWS}")
+    cells = rows * len(schema["fields"])
+    if cells > MAX_CELLS:
+        raise SchemaError(
+            f"num_rows × fields = {cells:,} cells; the limit is {MAX_CELLS:,}. "
+            "Reduce the row count or the number of fields."
+        )
     return schema
 
 
 # ---------- Schema inference --------------------------------------------
 
-# Order matters — first match wins. Use word-boundary or anchored patterns
-# to avoid e.g. "address" matching "ip_address" before the IP rule kicks in.
-NAME_HEURISTICS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"(?i)^(id|.*_id|.*Id)$"), "Row Number"),
-    (re.compile(r"(?i)e?_?mail"), "Email Address"),
-    (re.compile(r"(?i)ip[\-_]?address|^ip$|ipv4"), "IP Address v4"),
-    (re.compile(r"(?i)phone|tel(ephone)?|mobile|cell"), "Phone Number"),
-    (re.compile(r"(?i)(first|given|fore).?name|fname"), "First Name"),
-    (re.compile(r"(?i)(last|sur|family).?name|lname"), "Last Name"),
-    (re.compile(r"(?i)full[_\-]?name|^name$|display[_\-]?name|^user[_\-]?name$"), "Full Name"),
-    (re.compile(r"(?i)gender|sex"), "Gender"),
-    (re.compile(r"(?i)city|town"), "City"),
-    (re.compile(r"(?i)country|nation"), "Country"),
-    (re.compile(r"(?i)created|updated|deleted|modified|date|time|birth|dob|timestamp"), "Date"),
-    (re.compile(r"(?i)price|amount|cost|salary|balance|total|decimal|rate"), "Decimal"),
-    (re.compile(r"(?i)count|qty|quantity|number|age|rank|score|year"), "Number"),
+def _singular(word: str) -> str:
+    """Crude singular form so plural column names still match: "years" -> "year"."""
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Split snake_case, kebab-case and camelCase names into singular lower-case words.
+
+    "createdAt" -> ["created", "at"], "IPAddress" -> ["ip", "address"],
+    "years_active" -> ["year", "active"].
+    """
+    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", spaced)
+    return [_singular(t.lower()) for t in re.split(r"[^A-Za-z0-9]+", spaced) if t]
+
+
+def _has_phrase(tokens: list[str], *phrase: str) -> bool:
+    """True when `phrase` appears as consecutive words in `tokens`."""
+    n = len(phrase)
+    return any(tuple(tokens[i:i + n]) == phrase for i in range(len(tokens) - n + 1))
+
+
+def _is_row_number(t: list[str]) -> bool:
+    return bool(t) and t[-1] == "id"
+
+
+def _is_email(t: list[str]) -> bool:
+    return bool({"email", "mail", "emailaddress"} & set(t))
+
+
+def _is_ip(t: list[str]) -> bool:
+    return bool({"ip", "ipv4", "ipaddress", "ipaddr"} & set(t))
+
+
+def _is_phone(t: list[str]) -> bool:
+    return bool({"phone", "tel", "telephone", "mobile", "cell", "cellphone", "phonenumber"} & set(t))
+
+
+def _is_first_name(t: list[str]) -> bool:
+    return (
+        any(_has_phrase(t, w, "name") for w in ("first", "given", "fore"))
+        or bool({"firstname", "givenname", "forename", "fname"} & set(t))
+    )
+
+
+def _is_last_name(t: list[str]) -> bool:
+    return (
+        any(_has_phrase(t, w, "name") for w in ("last", "family", "sur"))
+        or bool({"lastname", "surname", "familyname", "lname"} & set(t))
+    )
+
+
+def _is_full_name(t: list[str]) -> bool:
+    return (
+        t in (["name"], ["user", "name"], ["username"])
+        or _has_phrase(t, "full", "name")
+        or _has_phrase(t, "display", "name")
+        or bool({"fullname", "displayname"} & set(t))
+    )
+
+
+_DATE_WORDS = {
+    "created", "updated", "deleted", "modified", "date", "time", "datetime",
+    "timestamp", "birth", "birthday", "birthdate", "dob",
+}
+
+
+def _is_date(t: list[str]) -> bool:
+    # "*_at" (created_at, publishedAt) is the usual timestamp convention.
+    return bool(_DATE_WORDS & set(t)) or (len(t) > 1 and t[-1] == "at")
+
+
+# Order matters — first match wins. Names are compared word by word, so
+# e.g. "paid" is not an id, "message" is not an age and "hotel" is not a phone.
+NAME_HEURISTICS: list[tuple[Callable[[list[str]], bool], str]] = [
+    (_is_row_number, "Row Number"),
+    (_is_email, "Email Address"),
+    (_is_ip, "IP Address v4"),
+    (_is_phone, "Phone Number"),
+    (_is_first_name, "First Name"),
+    (_is_last_name, "Last Name"),
+    (_is_full_name, "Full Name"),
+    (lambda t: bool({"gender", "sex"} & set(t)), "Gender"),
+    (lambda t: bool({"city", "town"} & set(t)), "City"),
+    (lambda t: bool({"country", "nation", "nationality"} & set(t)), "Country"),
+    (_is_date, "Date"),
+    (lambda t: bool({"price", "amount", "cost", "salary", "balance", "total", "decimal", "rate",
+                     "discount"} & set(t)), "Decimal"),
+    (lambda t: bool({"count", "qty", "quantity", "number", "age", "rank", "score", "year"} & set(t)),
+     "Number"),
 ]
 
 
 def _name_to_type(name: str, fallback: str = "Full Name") -> str:
-    for pattern, dtype in NAME_HEURISTICS:
-        if pattern.search(name):
+    tokens = _name_tokens(name)
+    for matches, dtype in NAME_HEURISTICS:
+        if matches(tokens):
             return dtype
     return fallback
 
@@ -622,7 +778,10 @@ _TS_INTERFACE_RE = re.compile(
     r"(?:interface|type)\s+\w+\s*=?\s*\{([^}]+)\}",
     re.DOTALL,
 )
-_TS_FIELD_RE = re.compile(r"^\s*(\w+)\s*\??\s*:\s*(.+?)\s*$")
+# `(.+)$` instead of `(.+?)\s*$`: the lazy group and the trailing `\s*`
+# overlapped, which made long whitespace runs quadratic. The type is
+# stripped by the caller instead.
+_TS_FIELD_RE = re.compile(r"^\s*(\w+)\s*\??\s*:\s*(.+)$")
 
 
 def infer_from_typescript(source: str) -> list[dict]:
@@ -673,7 +832,7 @@ def request_too_large(_e):
 
 @app.route("/")
 def index():
-    return render_template("index.html", default_schema=DEFAULT_SCHEMA)
+    return render_template("index.html", default_schema=DEFAULT_SCHEMA, max_rows=MAX_ROWS)
 
 
 @app.route("/preview", methods=["POST"])
@@ -715,7 +874,10 @@ def generate():
         data = generate_data(schema)
         fmt = schema["format"].upper()
         info = FORMATTERS[fmt]
-        output = info["format"](data)
+        if fmt == "CSV":
+            output = format_csv(data, escape_formulas=schema.get("csv_formula_escape", True))
+        else:
+            output = info["format"](data)
         if isinstance(output, str):
             output = output.encode("utf-8")
 
