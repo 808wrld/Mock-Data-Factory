@@ -375,6 +375,12 @@ function buildFieldRow(fieldId, initial = {}) {
     blankPercentageInput.setAttribute("data-i18n-placeholder", "schema.blank_placeholder");
     blankPercentageInput.min = "0";
     blankPercentageInput.max = "100";
+    // For Blank/Null fields blank_percentage is the field's own setting and
+    // lives in this input; for every other type it belongs to the Null % box.
+    const ownsBlankPct = initialType === "Blank/Null";
+    if (ownsBlankPct && initial.blank_percentage != null) {
+        blankPercentageInput.value = initial.blank_percentage;
+    }
     inputStack.appendChild(blankPercentageInput);
 
     const templateInput = document.createElement("input");
@@ -409,7 +415,7 @@ function buildFieldRow(fieldId, initial = {}) {
     nullModifier.min = "0";
     nullModifier.max = "100";
     nullModifier.setAttribute("value", "0");
-    if (initial.blank_percentage != null) {
+    if (!ownsBlankPct && initial.blank_percentage != null) {
         nullModifier.value = initial.blank_percentage;
     }
     blankModifier.appendChild(nullModifier);

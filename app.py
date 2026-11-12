@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -38,6 +39,14 @@ MAX_PREVIEW_ROWS = 100
 MAX_INFER_SOURCE = 32_000  # ~32KB of source text for inference
 MAX_FIELDS = 200            # cap field count per schema
 MAX_TEMPLATE_LENGTH = 1_000  # characters per Template field
+MAX_NAME_LENGTH = 128        # characters per field name (repeated on every row in JSON / XML / SQL)
+MAX_LIST_VALUE_LENGTH = 500  # characters per Custom List value
+MAX_TEMPLATE_OUTPUT = 4_000  # characters one rendered Template cell may produce
+# Total characters (field names + values) one request may generate. The cell
+# cap bounds the NUMBER of cells; this bounds their combined SIZE, so a small
+# request can't be amplified into gigabytes of output (e.g. a template that
+# repeats a long Custom List value 200 times on every row).
+MAX_OUTPUT_CHARS = int(os.getenv("MOCK_DATA_MAX_OUTPUT_CHARS", "200000000"))
 MAX_CONTENT_LENGTH = 256 * 1024  # 256KB request body cap
 
 # Reject oversized request bodies before Flask hands them to a route.
@@ -93,6 +102,17 @@ GENERATORS: dict[str, Callable[[dict | None], Any]] = {
     # Template values are filled in a second pass after all other fields exist.
     "Template": lambda _c: None,
 }
+
+
+# Characters that can't be exported: C0 control characters (invalid in XML 1.0
+# and rejected by openpyxl), lone surrogates (not encodable as UTF-8) and the
+# two non-characters XML forbids. Tab, newline and carriage return are fine.
+_UNEXPORTABLE_CHARS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def _check_text(value: str, what: str) -> None:
+    if _UNEXPORTABLE_CHARS.search(value):
+        raise SchemaError(f"{what} contains control characters that can't be exported")
 
 
 def generate_value(field_type: str, field_config: dict | None = None) -> Any:
@@ -210,6 +230,9 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
         if field["type"] == "Template"
     ]
     data: list[dict] = []
+    # Size of one row's keys; values are added as they are generated.
+    names_size = sum(len(field["name"]) for field in fields)
+    output_chars = 0
 
     for i in range(num_rows):
         row: dict[str, Any] = {}
@@ -226,8 +249,19 @@ def generate_data(schema: dict, max_rows: int | None = None) -> list[dict]:
         # Pass 2 — templates can reference any other field.
         for field, compiled in template_fields:
             value = render_compiled_template(compiled, row)
+            if len(value) > MAX_TEMPLATE_OUTPUT:
+                raise SchemaError(
+                    f'Template field "{field["name"]}" produces more than '
+                    f"{MAX_TEMPLATE_OUTPUT:,} characters per row"
+                )
             row[field["name"]] = _apply_blank_percentage(value, field)
 
+        output_chars += names_size + sum(len(v) if isinstance(v, str) else 8 for v in row.values())
+        if output_chars > MAX_OUTPUT_CHARS:
+            raise SchemaError(
+                f"Output would exceed {MAX_OUTPUT_CHARS:,} characters. "
+                "Reduce the row count, the number of fields or the length of names and values."
+            )
         data.append(row)
     return data
 
@@ -275,11 +309,15 @@ def format_csv(data: list[dict], escape_formulas: bool = True) -> str:
     """
     output = io.StringIO()
     if data:
-        writer = csv.DictWriter(output, fieldnames=_column_order(data))
-        writer.writeheader()
+        columns = _column_order(data)
+        writer = csv.DictWriter(output, fieldnames=columns)
         if escape_formulas:
+            # Field names are user input too (and can arrive through a shared
+            # schema link), so the header row gets the same treatment.
+            writer.writerow({col: _neutralize_formula(col) for col in columns})
             writer.writerows(_sanitize_row_for_export(row) for row in data)
         else:
+            writer.writeheader()
             writer.writerows(data)
     return output.getvalue()
 
@@ -401,6 +439,7 @@ def format_excel(data: list[dict]) -> bytes | None:
 
     for col_idx, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.data_type = "s"  # a field name starting with "=" must not become a formula
         cell.font = bold
 
     for row_idx, row_data in enumerate(data, 2):
@@ -460,6 +499,9 @@ def _validate_schema(schema: Any) -> dict:
         name = field.get("name")
         if not isinstance(name, str) or not name.strip():
             raise SchemaError(f"Field #{idx} requires a non-empty name")
+        if len(name) > MAX_NAME_LENGTH:
+            raise SchemaError(f"Field #{idx} name must be at most {MAX_NAME_LENGTH} characters")
+        _check_text(name, f"Field #{idx} name")
         if name in seen_names:
             raise SchemaError(f'Duplicate field name "{name}"')
         seen_names.add(name)
@@ -474,6 +516,16 @@ def _validate_schema(schema: Any) -> dict:
                 raise SchemaError(f'Custom List field "{name}" needs a non-empty "values" list')
             if not all(isinstance(v, (str, int, float, bool)) for v in values):
                 raise SchemaError(f'Custom List field "{name}" values must be strings or numbers')
+            for v in values:
+                if isinstance(v, str):
+                    if len(v) > MAX_LIST_VALUE_LENGTH:
+                        raise SchemaError(
+                            f'Custom List field "{name}" values must be at most '
+                            f"{MAX_LIST_VALUE_LENGTH} characters"
+                        )
+                    _check_text(v, f'Custom List field "{name}"')
+                elif isinstance(v, float) and not math.isfinite(v):
+                    raise SchemaError(f'Custom List field "{name}" values must be finite numbers')
         if ftype == "Template":
             template = field.get("template")
             if not isinstance(template, str) or not template.strip():
@@ -482,11 +534,12 @@ def _validate_schema(schema: Any) -> dict:
                 raise SchemaError(
                     f'Template field "{name}" must be at most {MAX_TEMPLATE_LENGTH} characters'
                 )
+            _check_text(template, f'Template field "{name}"')
         pct = field.get("blank_percentage")
         if pct is not None:
             try:
                 pct_int = int(pct)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:  # OverflowError: JSON Infinity
                 raise SchemaError(f'blank_percentage on "{name}" must be an integer') from exc
             if not 0 <= pct_int <= 100:
                 raise SchemaError(f'blank_percentage on "{name}" must be between 0 and 100')
@@ -503,7 +556,7 @@ def _validate_schema(schema: Any) -> dict:
         raise SchemaError(f"Unsupported format: {schema['format']}")
     try:
         rows = int(schema["num_rows"])
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:  # OverflowError: JSON Infinity
         raise SchemaError("num_rows must be an integer") from exc
     if rows < 1:
         raise SchemaError("num_rows must be at least 1")
