@@ -15,6 +15,8 @@ from app import (  # noqa: E402
     MAX_CELLS,
     MAX_CONTENT_LENGTH,
     MAX_FIELDS,
+    MAX_LIST_VALUE_LENGTH,
+    MAX_NAME_LENGTH,
     MAX_ROWS,
     MAX_TEMPLATE_LENGTH,
     SchemaError,
@@ -766,8 +768,9 @@ def test_validate_schema_rejects_non_scalar_custom_list_values():
 
 
 def test_validate_schema_rejects_too_many_cells():
-    fields = [{"name": f"c{i}", "type": "City"} for i in range(20)]
-    rows = MAX_CELLS // 20 + 1
+    # 40 fields, so the row count needed to exceed the cell cap stays below MAX_ROWS.
+    fields = [{"name": f"c{i}", "type": "City"} for i in range(40)]
+    rows = MAX_CELLS // 40 + 1
     if rows > MAX_ROWS:
         pytest.skip("MAX_ROWS is below the cell cap for this field count")
     with pytest.raises(SchemaError, match="cells"):
@@ -810,3 +813,119 @@ def test_format_sql_states_target_dialect():
 )
 def test_name_heuristics_match_whole_words(name, expected):
     assert _name_to_type(name, "(fallback)") == expected
+
+
+# ---- Second review ----------------------------------------------------------
+
+def test_validate_schema_rejects_overlong_field_name():
+    with pytest.raises(SchemaError, match="at most"):
+        _validate_schema(_schema([{"name": "n" * (MAX_NAME_LENGTH + 1), "type": "City"}]))
+
+
+def test_validate_schema_rejects_overlong_custom_list_value():
+    field = {"name": "a", "type": "Custom List", "values": ["x" * (MAX_LIST_VALUE_LENGTH + 1)]}
+    with pytest.raises(SchemaError, match="at most"):
+        _validate_schema(_schema([field]))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"name": "bad\x0bname", "type": "City"},
+        {"name": "a", "type": "Custom List", "values": ["bad\x00value"]},
+        {"name": "a", "type": "Custom List", "values": ["lone \ud800 surrogate"]},
+        {"name": "a", "type": "Template", "template": "x\x1f{{b}}"},
+    ],
+)
+def test_validate_schema_rejects_unexportable_characters(field):
+    # These used to reach the exporters and fail there with a 500
+    # (invalid XML, openpyxl IllegalCharacterError, UTF-8 encoding errors).
+    with pytest.raises(SchemaError, match="control characters"):
+        _validate_schema(_schema([field]))
+
+
+def test_validate_schema_allows_tabs_and_newlines_in_values():
+    field = {"name": "a", "type": "Custom List", "values": ["line one\nline two\tend"]}
+    _validate_schema(_schema([field]))
+
+
+@pytest.mark.parametrize("key", ["num_rows", "blank_percentage"])
+def test_validate_schema_rejects_infinity(key):
+    # json.loads accepts the literal Infinity; int(inf) raises OverflowError,
+    # which used to escape as a 500.
+    field = {"name": "a", "type": "City"}
+    schema = _schema([field])
+    if key == "num_rows":
+        schema["num_rows"] = float("inf")
+    else:
+        field["blank_percentage"] = float("inf")
+    with pytest.raises(SchemaError):
+        _validate_schema(schema)
+
+
+def test_validate_schema_rejects_non_finite_custom_list_numbers():
+    field = {"name": "a", "type": "Custom List", "values": [float("nan")]}
+    with pytest.raises(SchemaError, match="finite"):
+        _validate_schema(_schema([field]))
+
+
+def test_generate_endpoint_rejects_infinity_with_400(client):
+    body = '{"fields":[{"name":"a","type":"City"}],"num_rows":Infinity,"format":"CSV"}'
+    response = client.post("/generate", data=body, content_type="application/json")
+    assert response.status_code == 400
+
+
+def test_template_output_is_capped_per_cell():
+    # Regression: a 60 KB request (one long value repeated ~200 times by a
+    # template) produced 240 MB for 20 rows. Chained templates amplify too.
+    fields = [
+        {"name": "a", "type": "Custom List", "values": ["x" * MAX_LIST_VALUE_LENGTH]},
+        {"name": "t", "type": "Template", "template": "{{a}}" * 199},
+    ]
+    schema = _validate_schema(_schema(fields, num_rows=5))
+    with pytest.raises(SchemaError, match="per row"):
+        generate_data(schema)
+
+
+def test_generate_endpoint_reports_oversized_template_as_400(client):
+    fields = [
+        {"name": "a", "type": "Custom List", "values": ["x" * MAX_LIST_VALUE_LENGTH]},
+        {"name": "t", "type": "Template", "template": "{{a}}" * 199},
+    ]
+    response = client.post("/generate", json=_schema(fields, num_rows=5))
+    assert response.status_code == 400
+
+
+def test_total_output_size_is_capped(monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_OUTPUT_CHARS", 1_000)
+    schema = _validate_schema(_schema([{"name": "city", "type": "City"}], num_rows=5_000))
+    with pytest.raises(SchemaError, match="Output would exceed"):
+        generate_data(schema)
+
+
+def test_normal_requests_stay_within_the_output_budget():
+    schema = _validate_schema(_schema(DEFAULT_FIELDS_FOR_BUDGET, num_rows=2_000))
+    assert len(generate_data(schema)) == 2_000
+
+
+DEFAULT_FIELDS_FOR_BUDGET = [
+    {"name": "id", "type": "Row Number"},
+    {"name": "full_name", "type": "Full Name"},
+    {"name": "email", "type": "Email Address"},
+    {"name": "handle", "type": "Template", "template": "{{full_name|slug}}-{{id}}"},
+]
+
+
+def test_format_csv_escapes_formula_like_headers():
+    lines = format_csv([{"=cmd": "v"}]).splitlines()
+    assert lines[0] == "'=cmd"
+    assert format_csv([{"=cmd": "v"}], escape_formulas=False).splitlines()[0] == "=cmd"
+
+
+def test_format_excel_stores_formula_like_headers_as_text():
+    wb = openpyxl.load_workbook(io.BytesIO(format_excel([{"=1+1": "v"}])))
+    header = wb.active.cell(row=1, column=1)
+    assert header.value == "=1+1"
+    assert header.data_type == "s"

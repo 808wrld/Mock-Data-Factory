@@ -2,9 +2,9 @@
 
 > Schema-driven mock data generator with field templates and schema inference. CSV · JSON · XML · SQL · Excel.
 
-[![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/flask-3.1-000?logo=flask)](https://flask.palletsprojects.com/)
-[![Tests](https://img.shields.io/badge/tests-115%20passing-1F6A3E)](./tests)
+[![Tests](https://img.shields.io/badge/tests-138%20passing-1F6A3E)](./tests)
 [![i18n](https://img.shields.io/badge/i18n-EN%20·%20中-6F4A78)](#bilingual-ui)
 [![License](https://img.shields.io/badge/license-MIT-D94F1E)](#license)
 
@@ -30,7 +30,7 @@
 - **Schema persistence** — auto-saves to `localStorage`, exports as JSON, and shares via copyable URL hash.
 - **Bilingual UI** — EN / 中 toggle in the top-right corner; auto-picks Chinese for `zh-*` browser locales.
 - **16 data types**, **5 export formats**, per-field null modifier, drag-and-drop (or keyboard) reordering, light/dark theme.
-- **Safety caps**: `MOCK_DATA_MAX_ROWS` (default 100k) rows per request, `MOCK_DATA_MAX_CELLS` (default 2M) rows × fields, 200 fields per schema, 1,000 characters per template, 256 KB request body, 32 KB inference source — anything over the limit is rejected with a clean 400/413.
+- **Safety caps**: `MOCK_DATA_MAX_ROWS` (default 100k) rows per request, `MOCK_DATA_MAX_CELLS` (default 2M) rows × fields, `MOCK_DATA_MAX_OUTPUT_CHARS` (default 200M) characters of generated output, 200 fields per schema, 128 characters per field name, 500 per Custom List value, 1,000 per template (4,000 per rendered template cell), 256 KB request body, 32 KB inference source — anything over the limit is rejected with a clean 400/413.
 - **Spreadsheet-safe exports**: Excel cells are always stored as text, and CSV values starting with `=`, `+`, `-` or `@` are quote-prefixed (toggle **Excel-safe** off for CSVs meant for code).
 - **No CDN at runtime**: Bootstrap, Bootstrap Icons and SortableJS are vendored under `static/vendor/`; web fonts load without blocking the first render.
 
@@ -56,6 +56,7 @@ Open <http://127.0.0.1:5000>. (Use `PORT=5050` if macOS's AirPlay is hogging 500
 | `PORT`               | `5000`   | Port for the development server.                     |
 | `MOCK_DATA_MAX_ROWS` | `100000` | Hard cap on rows per request (DoS guard).            |
 | `MOCK_DATA_MAX_CELLS`| `2000000`| Hard cap on rows × fields per request.               |
+| `MOCK_DATA_MAX_OUTPUT_CHARS` | `200000000` | Hard cap on generated characters (names + values) per request. |
 
 ## Features in detail
 
@@ -215,7 +216,7 @@ The SQL export targets **SQLite / PostgreSQL**: identifiers are double-quoted an
 │   ├── css/main.css        Warm editorial theme
 │   ├── js/app.js           Schema editor · persistence · preview · download
 │   └── vendor/             Pinned Bootstrap, Bootstrap Icons, SortableJS (see vendor/README.md)
-├── tests/test_app.py       pytest suite — 115 tests
+├── tests/test_app.py       pytest suite — 138 tests
 ├── requirements.txt        Runtime dependencies
 ├── pyproject.toml          pytest + ruff config
 └── README.md
@@ -225,7 +226,7 @@ The SQL export targets **SQLite / PostgreSQL**: identifiers are double-quoted an
 
 ```bash
 pip install pytest ruff
-pytest                   # 115 tests in ~1s
+pytest                   # 138 tests in ~1s
 ruff check .             # lint
 ```
 
